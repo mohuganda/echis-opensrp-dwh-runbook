@@ -37,6 +37,37 @@ Reporting warehouse layer
 
 MoH BI tools should query the `dwh` layer, not raw FHIR JSON directly.
 
+
+### Key reporting tables
+
+The main tables used for reporting are explained in detail in:
+
+- [`docs/reporting-data-model.md`](docs/reporting-data-model.md)
+- [`docs/commodity-module-reporting-guide.md`](docs/commodity-module-reporting-guide.md)
+- [`docs/cebs-module-reporting-guide.md`](docs/cebs-module-reporting-guide.md)
+
+The most important dimensions are:
+
+```text
+dwh.dim_locations                  DHIS2-mapped reporting location hierarchy
+dwh.dim_practitioner_assignments  current practitioner/user assignments
+dwh.dim_patients                   patient/client demographics
+dwh.dim_patient_program_status    current patient programme/status flags
+dwh.dim_households                 household records
+dwh.dim_commodities                commodity/item definitions
+```
+
+The most important facts are:
+
+```text
+dwh.fact_observations                  general Observation facts
+dwh.fact_commodity_stock_movements     commodity stock movements
+dwh.fact_cebs_observations             CEBS signal/no-signal reports
+dwh.fact_encounters                    service/form encounters
+dwh.fact_flags                         visitor, stockout, and other flags
+dwh.fact_conditions                    patient conditions and programme states
+```
+
 ---
 
 ## 2. Recommended production architecture
