@@ -1,0 +1,22 @@
+# Environment files (contain credentials)
+*.env
+.env
+ops/*.env
+!ops/*.env.example
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Temp / scratch
+*.tmp

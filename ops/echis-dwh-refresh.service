@@ -1,0 +1,11 @@
+[Unit]
+Description=eCHIS OpenSRP DWH Daily Refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/echis-dwh/dwh.env
+ExecStart=/opt/echis-dwh/run_daily_refresh.sh
+User=postgres
+Group=postgres
