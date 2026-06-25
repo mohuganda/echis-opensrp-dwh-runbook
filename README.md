@@ -8,6 +8,28 @@ The intended readers are MoH warehouse administrators, analysts, and BI support 
 
 ---
 
+## Background: how the source data is structured
+
+OpenSRP stores all clinical and operational data as FHIR resources. Airbyte replicates these resources into the analytics database under the `airbyte` schema. Each Airbyte table corresponds to one FHIR resource type, for example `airbyte.patient`, `airbyte.observation`, `airbyte.location`.
+
+Every Airbyte table has this common structure:
+
+```text
+id                        FHIR resource ID
+resource                  Full FHIR resource as JSONB
+_airbyte_extracted_at     When Airbyte last synced this row
+_airbyte_raw_id           Airbyte internal row identifier
+_airbyte_meta             Airbyte metadata
+```
+
+The `resource` column contains the entire FHIR resource as a JSON object. Querying it directly requires understanding FHIR structure and writing complex JSON path expressions. That is not practical for routine MoH reporting.
+
+The DWH layer solves this by flattening the FHIR JSON into simple relational tables with human-readable column names. A BI tool or analyst can then query `dwh.dim_patients` or `dwh.fact_observations` directly without needing to understand FHIR.
+
+One important pattern in the source data is **resource meta tags**. When a VHT submits a service record, OpenSRP stamps the FHIR resource with metadata tags identifying the practitioner, care team, organisation, and location at the time of submission. The DWH extracts these tags as `practitioner_tag_id`, `care_team_tag_id`, `organization_tag_id`, and `location_tag_id` on fact tables. These tags are the historical truth for where and by whom a service was delivered — even if the user's current assignment later changes.
+
+---
+
 ## 1. What this setup creates
 
 The setup creates a reporting layer like this:
@@ -155,11 +177,22 @@ Run these in order.
 
 ### Step 0: Check the Airbyte source schema
 
+Before setting up anything, confirm that Airbyte has replicated the required FHIR tables into the `airbyte` schema and that the expected columns are present. All DWH refresh procedures read FHIR data from the `resource` JSONB column — if that column is missing or the table does not exist, the procedures will fail. This check also confirms that `_airbyte_extracted_at` is present, because it is used as the watermark for incremental refreshes.
+
 Run: [`sql/00-check-airbyte-source.sql`](sql/00-check-airbyte-source.sql)
 
 This confirms that the required raw tables and columns exist.
 
 ### Step 1: Create core schema and helper functions
+
+The `dwh` schema is the container for all reporting tables, procedures, and functions. The helper functions created here handle the repetitive work of reading FHIR JSON safely and consistently:
+
+- `fhir_ref_id()` extracts the resource ID from a FHIR reference string like `Patient/abc123`, returning just `abc123`.
+- `safe_timestamptz()` and `safe_numeric()` prevent procedures from crashing when the source data contains malformed or empty values.
+- `fhir_human_name()` and `fhir_meta_tag_code()` extract structured fields from FHIR JSON.
+- `age_in_days()`, `age_in_months()`, `age_in_years()`, and `reporting_age_group()` calculate ages relative to a given report date, so that age groupings stay correct over time as patients age.
+
+The `refresh_state` table tracks the last successful watermark and run status for each refresh procedure. Incremental procedures use this to know where to start, and it also surfaces any failures so they are visible without reading logs.
 
 Run: [`sql/01-core-schema-functions.sql`](sql/01-core-schema-functions.sql)
 
@@ -182,6 +215,14 @@ dwh.is_woman_of_reproductive_age()
 
 ### Step 2: Set up location and DHIS2 mapping
 
+Location setup is the most complex part of the DWH because the OpenSRP location hierarchy is not uniform across districts. The hierarchy is a tree of FHIR `Location` resources linked by `Location.partOf`. The depth varies — Kampala uses 5 levels (region → division → parish → zone), while Mukono and Kamwenge use 7 levels with a county and health facility in the middle.
+
+Because OpenSRP location IDs have no built-in DHIS2 org unit mapping, a manually maintained **seed file** is used as the bridge. The seed maps each OpenSRP location ID to a DHIS2 reporting facility name and org unit UID. This is the only table that needs human maintenance — everything else is rebuilt automatically from the FHIR source on each refresh.
+
+The final output is `dwh.dim_locations`, which flattens the full hierarchy into one row per location and adds the DHIS2 mapping, organization affiliation flags, and leaf-node indicators that reports need.
+
+See [`docs/location-hierarchy-dhis2-mapping-guide.md`](docs/location-hierarchy-dhis2-mapping-guide.md) for a full explanation of the hierarchy patterns, seed file structure, and how to update the mapping when new locations are added.
+
 Run the files in [`sql/02-location-dhis2-mapping/`](sql/02-location-dhis2-mapping/):
 
 1. [`01-create-tables-views-indexes.sql`](sql/02-location-dhis2-mapping/01-create-tables-views-indexes.sql)
@@ -193,6 +234,12 @@ The seed file maps OpenSRP location IDs to DHIS2 reporting facility names and DH
 
 ### Step 3: Set up admin dimensions
 
+In OpenSRP, the chain from a user to their reporting location runs through several linked FHIR resources: `PractitionerRole` → `CareTeam` participant → `CareTeam.managingOrganization` → `Organization` → `OrganizationAffiliation` → `Location`. Each link is a separate resource with its own Airbyte table.
+
+This step creates staging tables that unwrap each link in that chain and then flattens the entire chain into `dwh.dim_practitioner_assignments` — one row per practitioner role, with the assigned location, care team, and organisation in a single queryable row.
+
+Use `dim_practitioner_assignments` when a report needs to show current configured user assignments, headcounts by assignment level, or which locations have active practitioners assigned. For historical service records, use the location tags on the fact table rather than the practitioner's current assignment, because a user may have moved since the service was delivered.
+
 Run the files in [`sql/03-admin-practitioners-organizations/`](sql/03-admin-practitioners-organizations/):
 
 1. [`01-create-tables-indexes.sql`](sql/03-admin-practitioners-organizations/01-create-tables-indexes.sql)
@@ -203,6 +250,12 @@ This creates practitioner, organization, care team, organization affiliation, an
 
 ### Step 4: Set up clients and households
 
+FHIR uses the `Group` resource for both household groups and commodity groups, distinguished by `Group.code`: `35359004` means household, `386452003` means commodity. This step handles household groups and patient records only — commodities are covered in step 8.
+
+`dwh.dim_patients` stores one row per `Patient` resource with flattened demographics and location/practitioner tags. `dwh.dim_households` stores one row per household `Group`. Because the household membership relationship is stored as a list of `Group.member` references inside the group resource, a separate bridge table (`dwh.bridge_household_members`) is needed to query which patients belong to which household.
+
+Use `dim_patients` for patient demographics, age calculations, and joining to service facts. Use `dim_households` with the bridge for household-level reporting and coverage counts.
+
 Run the files in [`sql/04-clients-households/`](sql/04-clients-households/):
 
 1. [`01-create-tables-indexes.sql`](sql/04-clients-households/01-create-tables-indexes.sql)
@@ -212,6 +265,16 @@ Run the files in [`sql/04-clients-households/`](sql/04-clients-households/):
 This creates patients, households, related persons, and household membership tables.
 
 ### Step 5: Set up program fact tables
+
+This step creates the core service fact tables from five FHIR resource types:
+
+- **Encounter** — a form or service interaction submitted through the app. Each Encounter has a type, class, linked patient, and time period.
+- **Condition** — a programme enrolment or clinical problem such as ANC, PNC, HIV, TB, or sick child. Conditions have a clinical status (active, resolved, etc.) and are used to determine programme membership.
+- **Flag** — a marker placed on a patient or commodity, such as a visitor flag or a stockout flag. Flags have a start and end period.
+- **Observation** — any measured value or questionnaire response, including service delivery observations, CEBS surveillance signals, and commodity stock movements. Observations are the most flexible FHIR resource and carry the most data.
+- **ObservationComponent** — sub-values within a single Observation, stored separately because one Observation can have many components (for example, all the individual fields in a CEBS report form).
+
+The refresh procedure is incremental. After the initial run, it uses the `_airbyte_extracted_at` watermark from `dwh.refresh_state` and re-processes a one-day overlap window to catch any records that arrived slightly late. A full table rebuild is not needed on subsequent runs.
 
 Run the files in [`sql/05-program-facts/`](sql/05-program-facts/):
 
@@ -234,6 +297,12 @@ The refresh procedure is incremental. It uses `_airbyte_extracted_at` with a one
 
 ### Step 6: Set up reference code tables
 
+Before building reports, analysts often need to discover what observation codes, condition codes, flag codes, and categories are actually present in the data. Without this, it is hard to know which codes to filter on or which categories represent which services.
+
+Reference code tables solve this by pulling out all distinct code and category combinations from the fact tables and counting how many times each appears. This gives analysts a browseable catalogue of what is in the data, which codes are in active use, and which are rare or legacy.
+
+These tables are not used in fact-to-dimension joins. They are a discovery and classification tool. MoH analysts can review them and use the results to build correct code-based filters in their report queries.
+
 Run the files in [`sql/06-reference-codes/`](sql/06-reference-codes/):
 
 1. [`01-create-reference-tables.sql`](sql/06-reference-codes/01-create-reference-tables.sql)
@@ -244,6 +313,12 @@ These tables simply pull out distinct code/category combinations and usage count
 
 ### Step 7: Set up patient programme status
 
+Programme headcount questions — "how many patients are currently on ANC?", "how many active HIV clients are there?" — can be answered by filtering the `fact_conditions` table. But this requires the report writer to know the specific FHIR condition codes for each programme, and it means re-scanning the full conditions table every time.
+
+`dwh.dim_patient_program_status` solves this by pre-computing the answer. It maintains one current-status row per patient, rebuilt daily from the fact tables. Each row has simple boolean flags like `is_anc_client`, `has_hiv_condition`, and `is_current_visitor` that a report can filter directly without needing to know FHIR codes.
+
+This table is for **current status** only. For historical programme trend reporting — for example, how many new ANC enrolments happened in June — use `fact_conditions` directly.
+
 Run the files in [`sql/07-patient-program-status/`](sql/07-patient-program-status/):
 
 1. [`01-create-tables-codes-procedure.sql`](sql/07-patient-program-status/01-create-tables-codes-procedure.sql)
@@ -252,6 +327,14 @@ Run the files in [`sql/07-patient-program-status/`](sql/07-patient-program-statu
 This creates one current-status row per patient for visitor, HIV, TB, FP, ANC, PNC, and sick child reporting.
 
 ### Step 8: Set up commodity / supply / CEBS reporting
+
+Both commodity stock movements and CEBS surveillance signals are stored as FHIR `Observation` resources, but they use different categories and have very different reporting requirements, so they get their own dedicated tables.
+
+**Commodity stock movements:** Each stock movement (consumption, restock, physical count, adjustment) is an Observation where the subject is a commodity `Group` resource. The observation code encodes the movement type, and components carry the quantity and running balance. The `dim_commodities` table provides the commodity name and unit. `fact_commodity_stock_movements` gives one row per movement with all the fields needed for consumption and stock reporting.
+
+**CEBS surveillance:** CEBS reports are Observations with a CEBS-specific category. Each report is a VHT-submitted signal (or no-signal), with supervisor verification details stored as Observation components. Because CEBS reports have many fields spread across components, `fact_cebs_observations` is a wide denormalized table that turns those components into named columns for easy reporting.
+
+The refresh for this step is semi-incremental — it processes new records using the watermark but also rebuilds some running totals and stockout periods that span multiple time periods.
 
 Run the files in [`sql/08-commodity-cebs/`](sql/08-commodity-cebs/):
 
@@ -273,6 +356,12 @@ dwh.fact_cebs_observations
 
 ### Step 9: Create daily refresh procedure
 
+This creates the master orchestration procedure `dwh.refresh_all_daily()`, which calls each individual refresh procedure in the correct dependency order. Location must run before admin dimensions (because assignments join to locations), admin must run before facts (because facts join to practitioners and organizations), and so on.
+
+The procedure is designed to run once per day after the Airbyte sync has completed. If any individual refresh fails, the error is logged in `dwh.refresh_state` and the exception is re-raised, so the failure surfaces rather than being silently skipped.
+
+Before scheduling this procedure, validate it manually at least once to confirm all the individual procedures have been created and the data looks correct.
+
 Run: [`sql/09-daily-refresh/01-create-refresh-all-daily.sql`](sql/09-daily-refresh/01-create-refresh-all-daily.sql)
 
 Then validate manually:
@@ -282,6 +371,12 @@ CALL dwh.refresh_all_daily();
 ```
 
 ### Step 10: Configure scheduling
+
+The daily refresh should be scheduled to run automatically after the Airbyte sync completes each day. The timing matters: if the refresh runs before Airbyte has finished, it will pick up an incomplete watermark and miss records from that sync cycle.
+
+The ops files provide a systemd-based scheduling setup for Linux servers. The `.service` file defines the job that calls `dwh.refresh_all_daily()` via psql. The `.timer` file defines when it runs. The `.env.example` shows which database connection variables need to be set. The refresh script reads these variables and calls the procedure.
+
+Adjust the timer schedule to match when your Airbyte sync typically finishes. If Airbyte runs at midnight and takes 60–90 minutes, schedule the DWH refresh for 02:30 AM or later to be safe.
 
 Use files in [`ops/`](ops/):
 
