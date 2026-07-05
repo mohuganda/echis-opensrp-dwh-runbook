@@ -88,6 +88,8 @@ dwh.fact_cebs_observations             CEBS signal/no-signal reports
 dwh.fact_encounters                    service/form encounters
 dwh.fact_flags                         visitor, stockout, and other flags
 dwh.fact_conditions                    patient conditions and programme states
+dwh.fact_immunizations                 administered vaccine doses (from QuestionnaireResponse)
+dwh.fact_immunization_status           per-patient per-dose per-period coverage and tracking
 ```
 
 ---
@@ -370,7 +372,38 @@ Then validate manually:
 CALL dwh.refresh_all_daily();
 ```
 
-### Step 10: Configure scheduling
+### Step 10: Set up immunization reporting
+
+Immunization records in this system come from `airbyte.questionnaire_response`, **not** from `airbyte.immunization` or `airbyte.observation`. Those FHIR resource types had extraction errors during the Airbyte replication setup and are not reliable for this purpose. The QuestionnaireResponse forms submitted through the eCHIS app carry the full vaccination record — vaccine name, administered date, patient ID, and the standard location and practitioner metadata tags.
+
+This step creates three tables:
+
+- `dwh.ref_immunization_vaccine_map` — the vaccine schedule reference. One row per expected vaccine dose across all programmes (child immunization, malaria vaccine, HPV). The refresh procedures join to this table to normalize vaccine names and calculate per-child due dates.
+- `dwh.fact_immunizations` — one row per administered dose, extracted from QuestionnaireResponse. Incremental — uses the `_airbyte_extracted_at` watermark.
+- `dwh.fact_immunization_status` — one row per patient × expected dose × reporting period. This is the main table for coverage, zero-dose, under-immunized, FIC, and recovery reporting. It is rebuilt fully (delete + insert) for each reporting period.
+
+Because a child has one row per expected dose per month, always use `SELECT DISTINCT patient_id` when counting children in zero-dose or under-immunized reports.
+
+See [`docs/immunization-module-reporting-guide.md`](docs/immunization-module-reporting-guide.md) for the full conceptual guide, key definitions, and the vaccine schedule.
+
+Run the files in [`sql/10-immunization/`](sql/10-immunization/):
+
+1. [`01-create-tables-indexes.sql`](sql/10-immunization/01-create-tables-indexes.sql)
+2. [`02-seed-vaccine-reference-map.sql`](sql/10-immunization/02-seed-vaccine-reference-map.sql)
+3. [`03-create-refresh-procedures.sql`](sql/10-immunization/03-create-refresh-procedures.sql)
+4. [`04-run-and-validate.sql`](sql/10-immunization/04-run-and-validate.sql)
+
+This creates:
+
+```text
+dwh.ref_immunization_vaccine_map
+dwh.fact_immunizations
+dwh.fact_immunization_status
+```
+
+---
+
+### Step 11: Configure scheduling
 
 The daily refresh should be scheduled to run automatically after the Airbyte sync completes each day. The timing matters: if the refresh runs before Airbyte has finished, it will pick up an incomplete watermark and miss records from that sync cycle.
 
@@ -400,9 +433,15 @@ CALL dwh.refresh_locations();
 CALL dwh.refresh_admin_dimensions();
 CALL dwh.refresh_client_dimensions();
 CALL dwh.refresh_program_facts_base();
+
+CALL dwh.refresh_immunization_facts();
+CALL dwh.refresh_immunization_status_current_and_previous_month();
+
 CALL dwh.refresh_patient_program_status();
 CALL dwh.refresh_supply_cebs_reporting();
 ```
+
+Immunization runs after `refresh_program_facts_base()` because it depends on `dim_patients`. The status wrapper refreshes the previous month and current month. Older periods can be refreshed manually if backdated corrections arrive.
 
 Reference code refresh is not required daily. Run it weekly or after app/config changes:
 

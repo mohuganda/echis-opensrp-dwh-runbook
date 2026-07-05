@@ -733,6 +733,125 @@ Then call this after `dwh.refresh_all_daily()`.
 
 ---
 
+---
+
+## 4. Immunization tables
+
+Immunization data comes from `airbyte.questionnaire_response`, not from `airbyte.immunization` or `airbyte.observation`. See [`docs/immunization-module-reporting-guide.md`](immunization-module-reporting-guide.md) for the full explanation and report query examples.
+
+## 4.1 `dwh.ref_immunization_vaccine_map`
+
+### Purpose
+
+The vaccine schedule reference table. One row per expected vaccine dose across all programmes. Used by the refresh procedures to normalize vaccine names, assign antigen groups and dose numbers, and calculate per-child due dates.
+
+Do not query this directly for reporting. It is a lookup table used internally by the status refresh procedure.
+
+### Key columns
+
+| Column | Meaning |
+|---|---|
+| `programme` | `child_immunization`, `malaria_vaccine`, or `hpv_vaccine` |
+| `vaccine_name` | Full vaccine name as it appears in the QuestionnaireResponse form. Primary key component. |
+| `antigen_group` | Normalized reporting antigen: BCG, Polio, DPT-HepB-Hib, PCV, etc. |
+| `dose_label` | Dose label: Birth, Dose 1, Dose 2, etc. |
+| `dose_number` | Numeric dose sequence within the antigen group. |
+| `schedule_group` | Schedule group, e.g. `immunization_at_6_weeks`. |
+| `due_age_days` | Days from birth when this dose is due. |
+| `max_age_days` | Days from birth marking the end of the expected window. |
+| `eligibility_sex` | `female` for HPV; NULL for all other vaccines. |
+| `min_age_years`, `max_age_years` | Age range for eligibility (used for HPV). |
+| `include_in_child_immunization_reports` | True for routine child vaccines. |
+| `include_in_malaria_reports` | True for malaria vaccine doses. |
+| `include_in_hpv_reports` | True for HPV. |
+| `is_fic_required` | True for doses required for Fully Immunized Child status. |
+
+---
+
+## 4.2 `dwh.fact_immunizations`
+
+### Purpose
+
+One row per administered vaccine dose, extracted from QuestionnaireResponse resources. This is the raw administered-dose fact table.
+
+Use it for historical dose queries, administered-date filtering, and as the base for recovery analysis.
+
+### Grain
+
+One row per administered dose per QuestionnaireResponse submission.
+
+### Key columns
+
+| Column | Meaning |
+|---|---|
+| `questionnaire_response_id` | Source QuestionnaireResponse ID. |
+| `source_form` | Which form type produced this row: `child_immunization_record_all`, `child_immunization_single`, `malaria_vaccine_record`, `hpv_vaccine_record`. |
+| `patient_id` | Patient who received the dose. |
+| `administered_date` | Date the dose was given. |
+| `vaccine_name` | Vaccine name from the form, normalized against `ref_immunization_vaccine_map`. |
+| `programme` | `child_immunization`, `malaria_vaccine`, `hpv_vaccine`, or `unknown` if not mapped. |
+| `antigen_group` | Normalized antigen group. |
+| `dose_label` | Dose label. |
+| `patient_age_days_at_admin` | Patient age in days at administration date. |
+| `is_under_5_at_admin` | True if the patient was under 5 at the time of administration. |
+| `practitioner_id`, `care_team_id`, `location_id`, `organization_id` | Historical tags from the QuestionnaireResponse metadata. |
+
+---
+
+## 4.3 `dwh.fact_immunization_status`
+
+### Purpose
+
+One row per patient × expected vaccine dose × reporting period. This is the main table for all immunization coverage, zero-dose, under-immunized, FIC, and recovery reporting.
+
+The table is rebuilt fully (DELETE + INSERT) for each reporting period whenever the refresh procedure runs. It is not incremental.
+
+### Grain
+
+One row per patient per expected dose per reporting period.
+
+Because `is_zero_dose` and `is_under_immunised` are repeated across all dose rows for a child, always use `SELECT DISTINCT patient_id` when counting children.
+
+### Key columns
+
+| Column | Meaning |
+|---|---|
+| `reporting_period_start`, `reporting_period_end` | The reporting period this row covers. |
+| `patient_id` | Patient. |
+| `programme`, `antigen_group`, `dose_label` | Which dose this row is about. |
+| `due_date` | Date this dose became due for this child (birth date + due_age_days). |
+| `max_due_date` | End of the expected vaccination window. |
+| `is_due` | Dose was due before `reporting_period_end`. |
+| `is_received` | Patient received this dose before `reporting_period_end`. |
+| `received_date` | Actual administered date. |
+| `is_under_immunised` | Dose was due but not received. |
+| `is_zero_dose` | Child has received no under-5 vaccines by period end. |
+| `is_fully_immunised_child` | All FIC-required doses have been received. |
+| `is_recovered_this_period` | Dose was received during this reporting period (not in a prior period). |
+| `is_late_received` | Dose received after `max_due_date`. |
+| `follow_up_status` | `not_due`, `received`, `due_missing`, or `eligible`. |
+| `days_overdue` | Days past `due_date` if the dose remains unreceived. |
+| `district_name`, `health_facility_name`, `village_name`, etc. | Pre-joined location hierarchy from `dim_patients`. |
+| `reporting_facility_name`, `reporting_dhis2_orgunit_uid` | DHIS2 reporting mapping. |
+
+### Example
+
+```sql
+SELECT DISTINCT
+    patient_id,
+    patient_name,
+    age_months_at_period_end,
+    village_name,
+    health_facility_name,
+    caregiver_phone
+FROM dwh.fact_immunization_status
+WHERE reporting_period_start = date_trunc('month', current_date)::date
+  AND is_zero_dose = true
+ORDER BY health_facility_name, village_name, patient_name;
+```
+
+---
+
 ## 7. Quick table selection guide
 
 | Reporting question | Start with this table |
@@ -749,3 +868,7 @@ Then call this after `dwh.refresh_all_daily()`.
 | Service/form encounter counts | `dwh.fact_encounters` |
 | Visitor and stockout flags | `dwh.fact_flags`, `dwh.fact_commodity_stockout_periods` |
 | ANC/PNC/FP/HIV/TB/sick child conditions | `dwh.fact_conditions`, `dwh.dim_patient_program_status` |
+| Administered vaccine doses | `dwh.fact_immunizations` |
+| Immunization coverage / zero-dose / under-immunized | `dwh.fact_immunization_status` |
+| Vaccine dose recovery (zero-dose to immunized) | `dwh.fact_immunization_status`, `dwh.fact_immunizations` |
+| HPV coverage for girls 9–19 | `dwh.fact_immunization_status` (filter `programme = 'hpv_vaccine'`) |
