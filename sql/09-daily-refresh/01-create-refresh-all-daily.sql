@@ -24,6 +24,11 @@ BEGIN
     CALL dwh.refresh_patient_program_status();
     CALL dwh.refresh_supply_cebs_reporting();
 
+    CALL dwh.refresh_immunization_facts();
+    CALL dwh.refresh_immunization_status_current_and_previous_month();
+    CALL dwh.refresh_immunization_monthly_aggregates();
+    CALL dwh.refresh_immunization_monthly_report_mv();
+
     UPDATE dwh.refresh_state
     SET last_run_completed_at = clock_timestamp(), status = 'success', error_message = NULL
     WHERE table_name = v_table_name;

@@ -164,19 +164,55 @@ Unlike the incremental fact procedures, `refresh_immunization_status` uses a **f
 
 The rebuild process:
 
-1. **Eligible schedule**: Cross join `dim_patients` (active, non-deceased children in the eligible age range) with `ref_immunization_vaccine_map` to generate every expected dose for every eligible patient. Due dates are calculated per child: `birth_date + due_age_days`.
+1. **VHT lookup**: Build a deduplicated lookup of VHT practitioners from `dim_practitioner_assignments` (one row per practitioner where `is_vht = true`).
 
-2. **Received doses**: Look up which doses from `fact_immunizations` were administered before `p_period_end` for each patient.
+2. **Eligible schedule**: Cross join `dim_patients` (active, non-deceased children in the eligible age range) with `ref_immunization_vaccine_map` to generate every expected dose for every eligible patient. Due dates are calculated per child: `birth_date + due_age_days`. VHT name is joined here from the VHT lookup using the patient's assigned practitioner.
 
-3. **Status flags**: For each patient × dose combination, set `is_due`, `is_received`, `is_under_immunised`, `is_zero_dose`, `is_recovered_this_period`, etc.
+3. **Received doses**: Look up which doses from `fact_immunizations` were administered before `p_period_end` for each patient.
 
-4. **FIC calculation**: After computing all rows, aggregate across required doses to set `is_fully_immunised_child` consistently on every row for the patient.
+4. **Status flags**: For each patient × dose combination, set `is_due`, `is_received`, `is_under_immunised`, `is_zero_dose`, `is_recovered_this_period`, etc.
 
-The daily wrapper `refresh_immunization_status_current_and_previous_month()` refreshes the previous month and the current month. Older periods can be refreshed manually if backdated corrections are received.
+5. **FIC calculation**: After computing all rows, aggregate across required doses to set `is_fully_immunised_child` consistently on every row for the patient.
 
 ---
 
-## 8. Daily refresh order
+## 8. Two-tier storage design
+
+The immunization module uses two storage tiers to keep the database size manageable while supporting both operational follow-up and historical coverage reporting.
+
+### Tier 1 — `dwh.fact_immunization_status` (rolling window)
+
+Row-level data: one row per patient × expected dose × reporting period.
+
+**Purpose**: Operational. Used for follow-up line lists — who is zero-dose right now, which children need a visit this month, which VHT should act.
+
+**Retention**: The daily wrapper keeps only the current month, previous month, and the month before that (3 months). Older periods are deleted automatically. This limits the table to roughly 3–4 million rows regardless of how long the programme runs.
+
+**Why 3 months is enough**: Follow-up questions are time-bound. "Who was zero-dose in November 2024?" is not an actionable follow-up question anymore — the child has either been vaccinated or has aged out. For historical patient-level data, use `fact_immunizations` which keeps all records.
+
+### Tier 2 — `dwh.agg_immunization_monthly` (permanent history)
+
+Aggregated data: one row per month × location level × programme × antigen × dose.
+
+**Purpose**: Historical coverage reporting, trend charts, and DHIS2 submissions. Covers national, district, subcounty, parish, health facility, and village levels in one table via the `location_level` column.
+
+**Retention**: Kept for all months from programme start (September 2023 onwards). The table grows by roughly one new month's worth of rows each cycle — manageable forever.
+
+**antigen_group = 'ALL' rows**: Patient-level KPIs (zero_dose_count, fic_count, under_immunised_count) are stored on special summary rows where `antigen_group = 'ALL'` and `dose_label = 'ALL'`. Antigen-specific rows carry coverage metrics only (due_count, received_count). Use antigen-specific rows for Section 6 coverage indicators and `ALL` rows for Section 1 KPI counts.
+
+### Daily wrapper
+
+The daily wrapper `refresh_immunization_status_current_and_previous_month()` does all of this in sequence:
+
+1. Refresh `fact_immunization_status` for previous month
+2. Refresh `fact_immunization_status` for current month
+3. Refresh `agg_immunization_monthly` for previous month
+4. Refresh `agg_immunization_monthly` for current month
+5. Delete `fact_immunization_status` rows older than 3 months
+
+---
+
+## 9. Daily refresh order
 
 The immunization procedures run after `refresh_program_facts_base()` (because they depend on `dim_patients`) and before `refresh_patient_program_status()`:
 
@@ -190,9 +226,11 @@ CALL dwh.refresh_patient_program_status();
 CALL dwh.refresh_supply_cebs_reporting();
 ```
 
+`refresh_immunization_status_current_and_previous_month()` internally refreshes both the row-level status table and the monthly aggregate, and runs the rolling window cleanup.
+
 ---
 
-## 9. Manual refresh
+## 10. Manual refresh
 
 Refresh administered facts only (incremental):
 
@@ -200,7 +238,7 @@ Refresh administered facts only (incremental):
 CALL dwh.refresh_immunization_facts();
 ```
 
-Refresh status for the current month:
+Refresh row-level status for the current month:
 
 ```sql
 CALL dwh.refresh_immunization_status(
@@ -209,13 +247,28 @@ CALL dwh.refresh_immunization_status(
 );
 ```
 
-Refresh status for the previous month:
+Refresh row-level status for the previous month:
 
 ```sql
 CALL dwh.refresh_immunization_status(
     (date_trunc('month', current_date) - INTERVAL '1 month')::date,
     date_trunc('month', current_date)::date
 );
+```
+
+Refresh the monthly aggregate for a specific month:
+
+```sql
+CALL dwh.refresh_immunization_monthly_aggregate(
+    '2026-05-01'::date,
+    '2026-06-01'::date
+);
+```
+
+Run the full historical backfill from programme start (one-time, run after initial setup):
+
+```sql
+CALL dwh.refresh_immunization_monthly_aggregate_backfill('2023-09-01');
 ```
 
 Check refresh state:
@@ -229,12 +282,12 @@ ORDER BY last_run_started_at DESC;
 
 ---
 
-## 10. Notes and future improvements
+## 11. Notes and known limitations
 
 - **Zero-dose Penta1 proxy**: Add `is_zero_dose_penta1` if MoH wants to align with the standard EPI zero-dose definition based on DPT-HepB-Hib Dose 1.
-- **VHT name/phone**: `assigned_vht_name` and `assigned_vht_phone` are currently NULL. Add a precomputed `dim_patient_vht_assignment` table if VHT contact details are needed in every line list report.
-- **Materialized views**: Consider adding materialized views for common monthly summaries (by facility, by district, by antigen) if BI query response times become slow.
-- **Historical period refresh**: The daily wrapper only refreshes the current and previous month. If backdated corrections arrive for older periods, those months must be manually refreshed using `CALL dwh.refresh_immunization_status(start, end)`.
-- **Source form coverage**: The procedure includes a fallback filter (`resource::text ILIKE '%vaccine%'`) to catch any immunization QuestionnaireResponse forms not matched by the explicit questionnaire ID list. Review and add new questionnaire IDs to the explicit list as new forms are introduced.
+- **VHT name**: `assigned_vht_name` is now populated from `dim_practitioner_assignments` in the refresh procedure. `assigned_vht_phone` remains NULL — phone numbers are not available in the current DWH for practitioners.
+- **Historical period refresh**: The daily wrapper only refreshes the current and previous month. If backdated corrections arrive for older periods, manually refresh both the status table and the aggregate: `CALL dwh.refresh_immunization_status(start, end)` and `CALL dwh.refresh_immunization_monthly_aggregate(start, end)`.
+- **Aggregate backfill**: After initial setup, run `CALL dwh.refresh_immunization_monthly_aggregate_backfill('2023-09-01')` once to populate all historical months. Expect 5–15 minutes total.
+- **Source form coverage**: The refresh procedure includes a fallback filter (`resource::text ILIKE '%vaccine%'`) to catch any immunization QuestionnaireResponse forms not matched by the explicit questionnaire ID list. Review and add new questionnaire IDs to the explicit list as new forms are introduced.
 
 See [`examples/immunization-reports.sql`](../examples/immunization-reports.sql) for report queries.

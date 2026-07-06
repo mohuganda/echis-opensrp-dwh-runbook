@@ -850,6 +850,33 @@ WHERE reporting_period_start = date_trunc('month', current_date)::date
 ORDER BY health_facility_name, village_name, patient_name;
 ```
 
+## 4.4 `dwh.agg_immunization_monthly`
+
+Permanent monthly aggregate history from September 2023 onwards. One row per reporting month × location level × indicator × dimension. Built directly from `fact_immunizations + dim_patients + ref_immunization_vaccine_map` — no dependency on `fact_immunization_status`.
+
+`location_level` values: `national` | `district` | `subcounty` | `parish` | `health_facility` | `village`
+
+`report_section` values:
+- `coverage_by_antigen` — one row per antigen/dose, with `due_count`, `received_count`, `missed_count`, `late_received_count`, `indicator_value` (coverage %)
+- `facility_kpi_summary` — patient-level KPI rows identified by `indicator_code`:
+
+| `indicator_code` | Meaning |
+|---|---|
+| `IMM-ZD-OPEN` | Zero-dose children |
+| `IMM-UI-OPEN` | Under-immunised children |
+| `IMM-RECOVERED` | Children immunized this period |
+| `IMM-FIC-COV` | Fully immunised child (FIC) coverage % |
+
+`dimension_key` for coverage rows = `programme|antigen_group|dose_label`. For KPI rows = `all`.
+
+Never auto-deleted. Use for trend dashboards, DHIS2 reporting, and any query spanning more than 3 months.
+
+Refreshed daily by `dwh.refresh_immunization_monthly_aggregates()` (previous month + current month). One-time backfill via `dwh.refresh_immunization_monthly_aggregate_backfill('2023-09-01')`.
+
+## 4.5 `dwh.mv_immunization_monthly_report`
+
+Materialized view over `dwh.agg_immunization_monthly` with identical columns. Use this as the BI tool query target. Refreshed after the aggregate via `dwh.refresh_immunization_monthly_report_mv()`.
+
 ---
 
 ## 7. Quick table selection guide
@@ -869,6 +896,7 @@ ORDER BY health_facility_name, village_name, patient_name;
 | Visitor and stockout flags | `dwh.fact_flags`, `dwh.fact_commodity_stockout_periods` |
 | ANC/PNC/FP/HIV/TB/sick child conditions | `dwh.fact_conditions`, `dwh.dim_patient_program_status` |
 | Administered vaccine doses | `dwh.fact_immunizations` |
-| Immunization coverage / zero-dose / under-immunized | `dwh.fact_immunization_status` |
+| Immunization coverage / zero-dose / under-immunized (current month, line-list) | `dwh.fact_immunization_status` |
+| Immunization coverage / KPIs / trends (historical, BI dashboards) | `dwh.mv_immunization_monthly_report` |
 | Vaccine dose recovery (zero-dose to immunized) | `dwh.fact_immunization_status`, `dwh.fact_immunizations` |
-| HPV coverage for girls 9–19 | `dwh.fact_immunization_status` (filter `programme = 'hpv_vaccine'`) |
+| HPV coverage for girls 9–19 | `dwh.mv_immunization_monthly_report` (filter `programme = 'hpv_vaccine'`) |

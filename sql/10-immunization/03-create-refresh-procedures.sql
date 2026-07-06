@@ -283,7 +283,17 @@ BEGIN
     WHERE reporting_period_start = p_period_start
       AND reporting_period_end = p_period_end;
 
-    WITH eligible_schedule AS (
+    WITH vht_lookup AS (
+        -- One row per practitioner — deduplicates in case a VHT has multiple active roles.
+        SELECT DISTINCT ON (practitioner_id)
+            practitioner_id,
+            practitioner_name AS vht_name
+        FROM dwh.dim_practitioner_assignments
+        WHERE is_vht = true
+          AND COALESCE(active, true) = true
+        ORDER BY practitioner_id
+    ),
+    eligible_schedule AS (
         SELECT
             p.patient_id,
             p.patient_name,
@@ -313,11 +323,13 @@ BEGIN
             p.village_name,
             p.reporting_facility_name,
             p.reporting_dhis2_orgunit_uid,
+            vht.vht_name,
             m.*,
             CASE WHEN m.due_age_days IS NOT NULL THEN (p.birth_date + (m.due_age_days || ' days')::interval)::date END AS due_date,
             CASE WHEN m.max_age_days IS NOT NULL THEN (p.birth_date + (m.max_age_days || ' days')::interval)::date END AS max_due_date
         FROM dwh.dim_patients p
         JOIN dwh.ref_immunization_vaccine_map m ON true
+        LEFT JOIN vht_lookup vht ON vht.practitioner_id = p.practitioner_id
         WHERE p.birth_date IS NOT NULL
           AND COALESCE(p.active, true) = true
           AND COALESCE(p.is_deceased, false) = false
@@ -385,8 +397,8 @@ BEGIN
             es.patient_care_team_id,
             es.patient_organization_id,
             es.patient_practitioner_id AS assigned_practitioner_id,
-            NULL::text AS assigned_vht_name,
-            NULL::text AS assigned_vht_phone,
+            es.vht_name AS assigned_vht_name,
+            NULL::text AS assigned_vht_phone,  -- phone not available in dim_practitioner_assignments
             es.programme,
             es.vaccine_name,
             es.antigen_group,
@@ -484,21 +496,47 @@ END;
 $$;
 
 -- ============================================================================
--- Procedure 3: Daily wrapper — refresh previous and current month
+-- Procedure 3: Status table purge helper
 -- ============================================================================
+--
+-- Removes fact_immunization_status rows older than p_keep_from.
+-- Default: start of the current quarter (keeps ~1-3 months for follow-up).
+-- The aggregate table (agg_immunization_monthly) is never touched here.
+
+CREATE OR REPLACE PROCEDURE dwh.purge_old_immunization_status(
+    p_keep_from date DEFAULT (date_trunc('quarter', current_date))::date
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_rows_deleted integer := 0;
+BEGIN
+    DELETE FROM dwh.fact_immunization_status
+    WHERE reporting_period_start < p_keep_from;
+    GET DIAGNOSTICS v_rows_deleted = ROW_COUNT;
+    RAISE NOTICE 'Deleted % old immunization status rows (keep from %)', v_rows_deleted, p_keep_from;
+END;
+$$;
+
+-- ============================================================================
+-- Procedure 4: Daily wrapper — refresh status for current + previous month
+-- ============================================================================
+--
+-- Refreshes the row-level operational line-list for the two most recent months,
+-- then purges status rows older than the start of the current quarter.
+--
+-- The monthly aggregate (agg_immunization_monthly) is managed separately by
+-- dwh.refresh_immunization_monthly_aggregates() in 05-create-aggregate-table.sql.
 
 CREATE OR REPLACE PROCEDURE dwh.refresh_immunization_status_current_and_previous_month()
-LANGUAGE plpgsql
-AS $$
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_current_start date := date_trunc('month', current_date)::date;
+    v_current_end   date := (date_trunc('month', current_date) + INTERVAL '1 month')::date;
+    v_prev_start    date := (date_trunc('month', current_date) - INTERVAL '1 month')::date;
+    v_prev_end      date := date_trunc('month', current_date)::date;
 BEGIN
-    CALL dwh.refresh_immunization_status(
-        (date_trunc('month', current_date) - INTERVAL '1 month')::date,
-        date_trunc('month', current_date)::date
-    );
-
-    CALL dwh.refresh_immunization_status(
-        date_trunc('month', current_date)::date,
-        (date_trunc('month', current_date) + INTERVAL '1 month')::date
-    );
+    CALL dwh.refresh_immunization_status(v_prev_start,    v_prev_end);
+    CALL dwh.refresh_immunization_status(v_current_start, v_current_end);
+    CALL dwh.purge_old_immunization_status((date_trunc('quarter', current_date))::date);
 END;
 $$;
