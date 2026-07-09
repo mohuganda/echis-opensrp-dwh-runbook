@@ -4,6 +4,10 @@
 ops/*.env
 !ops/*.env.example
 
+# Local Claude Code context (not for the shared repo)
+CLAUDE.md
+.claude/
+
 # macOS
 .DS_Store
 .AppleDouble
