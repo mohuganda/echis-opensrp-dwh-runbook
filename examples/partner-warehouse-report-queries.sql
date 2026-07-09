@@ -344,3 +344,138 @@ SELECT
 FROM dwh.mv_imm_patient_status
 -- WHERE district_name = 'Kampala'
 ;
+
+
+-- ============================================================
+-- 9. FIC CHILDREN LINE LIST
+-- ============================================================
+-- One row per fully immunized child (all 19 EPI doses received).
+-- Useful for verification, community recognition, and reporting
+-- to the district health office.
+-- Only children aged ≥18 months (540 days) are eligible for FIC
+-- since MR2 is the last dose and is due at 18 months.
+-- ============================================================
+
+SELECT
+    patient_id,
+    patient_name,
+    gender,
+    date_of_birth,
+    age_months,
+    vht_name,
+    village_name,
+    parish_name,
+    subcounty_name,
+    health_facility_name,
+    district_name,
+
+    -- Date each dose was received
+    bcg_date,
+    hepb0_date,
+    opv0_date,
+    opv1_date,
+    dpt1_date,
+    pcv1_date,
+    rota1_date,
+    ipv1_date,
+    opv2_date,
+    dpt2_date,
+    pcv2_date,
+    rota2_date,
+    opv3_date,
+    dpt3_date,
+    pcv3_date,
+    ipv2_date,
+    mr1_date,
+    yf_date,
+    mr2_date,
+
+    -- Date the last required dose (MR2) was received — effectively the FIC completion date
+    mr2_date                                                                AS fic_completion_date,
+
+    snapshot_date
+
+FROM dwh.mv_imm_patient_status
+WHERE is_fic = true
+  -- AND district_name        = 'Kampala'
+  -- AND subcounty_name       = 'Kawempe Division'
+  -- AND health_facility_name = 'Kawempe HC IV'
+ORDER BY mr2_date DESC, village_name, patient_name;
+
+
+-- ============================================================
+-- 10. FULL PATIENT STATUS EXPORT
+-- ============================================================
+-- All registered children with every dose date column.
+-- Use this when you need to export the full dataset to Excel
+-- or another tool for custom analysis.
+-- Tip: in pgAdmin, run the query then right-click the result
+-- grid → "Copy All Rows" or use File → Export to CSV.
+-- ============================================================
+
+SELECT
+    -- Identity
+    patient_id,
+    patient_name,
+    gender,
+    date_of_birth,
+    age_days,
+    age_months,
+
+    -- Status flags
+    is_zero_dose,
+    is_under_immunised,
+    is_fic,
+    child_doses_received,
+
+    -- Child EPI dose dates (NULL = not yet received)
+    bcg_date,
+    hepb0_date,
+    opv0_date,
+    opv1_date,
+    dpt1_date,
+    pcv1_date,
+    rota1_date,
+    ipv1_date,
+    opv2_date,
+    dpt2_date,
+    pcv2_date,
+    rota2_date,
+    opv3_date,
+    dpt3_date,
+    pcv3_date,
+    ipv2_date,
+    mr1_date,
+    yf_date,
+    mr2_date,
+
+    -- Malaria dose dates
+    malaria1_date,
+    malaria2_date,
+    malaria3_date,
+    malaria_booster_date,
+    malaria_doses_received,
+
+    -- HPV dose dates
+    hpv1_date,
+    hpv2_date,
+    hpv_doses_received,
+
+    -- VHT and location
+    vht_name,
+    caregiver_phone,
+    village_name,
+    parish_name,
+    health_facility_name,
+    subcounty_name,
+    county_name,
+    district_name,
+    region_name,
+
+    snapshot_date
+
+FROM dwh.mv_imm_patient_status
+-- WHERE district_name        = 'Kampala'
+-- WHERE subcounty_name       = 'Kawempe Division'
+-- WHERE health_facility_name = 'Kawempe HC IV'
+ORDER BY district_name, subcounty_name, village_name, patient_name;
