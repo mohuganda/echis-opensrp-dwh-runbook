@@ -447,3 +447,120 @@ FROM dwh.mv_imm_patient_status;
 3. Query the history table with a `WHERE report_month = '2025-06-01'` filter to see any month's snapshot.
 
 This is a lightweight approach that costs only disk space and a one-off insert per month. The ETL team can automate it with a cron job or pg_cron.
+
+---
+
+## 8. Validating the numbers
+
+Before relying on any report numbers, run these checks to confirm the data is complete and consistent.
+
+### Check 1: Confirm the snapshot is fresh
+
+```sql
+SELECT MAX(snapshot_date) AS last_refreshed FROM dwh.mv_imm_patient_status;
+```
+
+If this date is more than a day or two old, refresh the view before reporting.
+
+### Check 2: Total children should match the patient dimension
+
+The MV includes all current, non-deceased children under 5 with a date of birth. Compare the MV count against the source table directly:
+
+```sql
+-- Count in the MV
+SELECT COUNT(*) FROM dwh.mv_imm_patient_status;
+
+-- Count in the source dimension (should be the same)
+SELECT COUNT(*)
+FROM dwh.dim_opensrp_patient
+WHERE is_current_flag = 'true'
+  AND (deceased IS NULL OR deceased = 'false')
+  AND date_of_birth IS NOT NULL AND date_of_birth <> ''
+  AND date_of_birth::date BETWEEN CURRENT_DATE - INTERVAL '5 years' AND CURRENT_DATE;
+```
+
+These two numbers should match. A meaningful difference means either the MV definition or the patient dimension has a filter mismatch.
+
+### Check 3: BCG should be the highest dose count
+
+BCG is given at birth, so it should have the highest coverage of all vaccines. If any later dose (e.g. OPV1 or DPT1) shows a higher count than BCG, something is wrong with the data or the vaccine name matching.
+
+```sql
+SELECT
+    COUNT(*) FILTER (WHERE bcg_date   IS NOT NULL) AS bcg,
+    COUNT(*) FILTER (WHERE hepb0_date IS NOT NULL) AS hepb0,
+    COUNT(*) FILTER (WHERE opv0_date  IS NOT NULL) AS opv0,
+    COUNT(*) FILTER (WHERE opv1_date  IS NOT NULL) AS opv1,
+    COUNT(*) FILTER (WHERE dpt1_date  IS NOT NULL) AS dpt1,
+    COUNT(*) FILTER (WHERE opv2_date  IS NOT NULL) AS opv2,
+    COUNT(*) FILTER (WHERE dpt2_date  IS NOT NULL) AS dpt2,
+    COUNT(*) FILTER (WHERE opv3_date  IS NOT NULL) AS opv3,
+    COUNT(*) FILTER (WHERE dpt3_date  IS NOT NULL) AS dpt3,
+    COUNT(*) FILTER (WHERE mr1_date   IS NOT NULL) AS mr1,
+    COUNT(*) FILTER (WHERE mr2_date   IS NOT NULL) AS mr2
+FROM dwh.mv_imm_patient_status;
+```
+
+Expected pattern: counts should decrease as doses get later in the schedule. A child who got OPV3 should also have OPV1 and OPV2 — so OPV1 ≥ OPV2 ≥ OPV3 always.
+
+### Check 4: Zero-dose percentage should be plausible
+
+Cross-check the zero-dose percentage against the raw fact table:
+
+```sql
+-- How many children under 24 months have at least one dose in the raw fact table?
+SELECT COUNT(DISTINCT patient_id) AS children_with_any_dose
+FROM dwh.fact_opensrp_immunizations
+WHERE vaccine_name ILIKE ANY(ARRAY[
+    'BCG%','HepB 0%','Polio%','DPT-HepB Hib%','PCV%','Rota%','IPV%',
+    'Measles%Rubella%','Yellow Fever%'
+]);
+```
+
+The MV zero-dose count (children aged 0–24 months with no doses) plus this number should roughly equal the total eligible_0_24m in the MV. They won't be exact because of age filtering, but the gap should be small.
+
+### Check 5: Spot-check a specific child
+
+Pick a known patient ID and verify their MV row matches what is in the raw fact table:
+
+```sql
+-- MV record for one child
+SELECT * FROM dwh.mv_imm_patient_status
+WHERE patient_id = 'replace-with-actual-id';
+
+-- Raw doses for the same child
+SELECT vaccine_name, administered_date
+FROM dwh.fact_opensrp_immunizations
+WHERE patient_id = 'replace-with-actual-id'
+ORDER BY administered_date;
+```
+
+The dose dates in the MV should match the earliest `administered_date` for each vaccine in the fact table.
+
+### Check 6: No doses recorded before the child's date of birth
+
+This catches data entry errors or ETL issues with date parsing:
+
+```sql
+SELECT COUNT(*) AS suspicious_records
+FROM dwh.mv_imm_patient_status
+WHERE LEAST(
+    bcg_date, hepb0_date, opv0_date, opv1_date, dpt1_date,
+    pcv1_date, rota1_date, ipv1_date, opv2_date, dpt2_date
+) < date_of_birth::date;
+```
+
+This should return 0. Any non-zero result means some dose dates are being set before the child's recorded birth date — worth investigating in the source records.
+
+### What numbers to expect (based on current data)
+
+As a reference, when this setup was validated the numbers were:
+
+| Metric | Value |
+|---|---|
+| Children aged 0–24 months | ~7,000 |
+| Zero-dose (0–24 months) | ~73% |
+| FIC count | ~1,900 |
+| BCG coverage | highest of all doses |
+
+These will shift as more data is captured. If you see zero-dose above 85% or FIC above 30% of under-5s, double-check that the MV has been refreshed and the ETL is running correctly.
