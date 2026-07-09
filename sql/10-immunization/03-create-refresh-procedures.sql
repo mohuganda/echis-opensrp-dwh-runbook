@@ -206,7 +206,7 @@ BEGIN
         CASE WHEN p.birth_date IS NOT NULL THEN r.administered_date < p.birth_date + INTERVAL '5 years' END,
         r._airbyte_extracted_at, clock_timestamp()
     FROM all_rows r
-    LEFT JOIN dwh.ref_immunization_vaccine_map m ON m.vaccine_name = r.vaccine_name
+    LEFT JOIN dwh.ref_immunization_vaccine_map m ON m.vaccine_name = REPLACE(r.vaccine_name, '_', '-')
     LEFT JOIN dwh.dim_patients p ON p.patient_id = r.patient_id
     WHERE r.patient_id IS NOT NULL AND r.administered_date IS NOT NULL AND r.vaccine_name IS NOT NULL
     ON CONFLICT (questionnaire_response_id, source_link_id, vaccine_name, dose_label)

@@ -135,7 +135,7 @@ BEGIN
             patient_id,
             COUNT(*) FILTER (
                 WHERE administered_date < v_period_end
-                  AND programme IN ('child_immunization', 'malaria_vaccine')
+                  AND programme = 'child_immunization'
             ) AS under5_received_count
         FROM dwh.fact_immunizations
         GROUP BY patient_id
@@ -187,10 +187,10 @@ BEGIN
     FROM dwh.dim_patients p
     JOIN dwh.ref_immunization_vaccine_map m ON true
     LEFT JOIN received r
-           ON r.patient_id  = p.patient_id
-          AND r.programme    = m.programme
-          AND r.vaccine_name = m.vaccine_name
-          AND r.dose_label   = m.dose_label
+           ON r.patient_id                        = p.patient_id
+          AND r.programme                         = m.programme
+          AND REPLACE(r.vaccine_name, '_', '-')   = m.vaccine_name
+          AND r.dose_label                        = m.dose_label
     LEFT JOIN under5_counts u ON u.patient_id = p.patient_id
     WHERE p.birth_date IS NOT NULL
       AND COALESCE(p.active,      true)  = true
