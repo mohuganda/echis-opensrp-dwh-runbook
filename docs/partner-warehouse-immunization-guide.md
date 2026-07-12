@@ -48,20 +48,20 @@ Key columns:
 | `patient_name` | Child's full name |
 | `date_of_birth` | Used to calculate age and eligibility |
 | `gender` | M / F |
-| `community_location_uuid` | The village/location where this child is registered — links to `dim_opensrp_locations_mapping` |
+| `practitioner_location` | The location UUID for this child's area — joins to `dwh.dim_locations` |
 | `practitioner` | The VHT ID assigned to this child — links to `dim_opensrp_practitioner` |
 | `is_current_flag` | `'true'` for the current record. The table is a Type 2 slowly changing dimension, meaning old versions of a record are kept. **Always filter `WHERE is_current_flag = 'true'`** when querying this table directly. |
 | `deceased` | `'true'` if the child has been marked as deceased. The MV excludes deceased children. |
 
-### `dwh.dim_opensrp_locations_mapping`
+### `dwh.dim_locations`
 
-The location hierarchy. One row = one location (village, parish, subcounty, etc.) with its full path from village up to region.
+The location hierarchy. One row = one location (village, parish, subcounty, etc.) with its full path from village up to region. This table is copied from the main eCHIS DWH — export from `dwh.dim_locations` there and import here whenever locations change.
 
 Key columns:
 
 | Column | What it holds |
 |---|---|
-| `location_id` | Unique location identifier — joins to `dim_opensrp_patient.community_location_uuid` |
+| `location_id` | Unique location identifier — joins to `dim_opensrp_patient.practitioner_location` |
 | `village_name` | Village-level name |
 | `parish_name` | Parish |
 | `health_facility_name` | The health facility that serves this village |

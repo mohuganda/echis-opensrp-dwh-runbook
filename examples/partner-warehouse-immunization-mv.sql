@@ -4,9 +4,8 @@
 -- fact_immunization_status or agg_immunization_monthly.
 --
 -- Tables used:
---   dwh.dim_opensrp_patient               Patient demographics (Type 2 SCD — filter is_current_flag = 'true')
---   dwh.fact_opensrp_immunizations        Dose records
---   dwh.dim_opensrp_locations_mapping     Location hierarchy (join: location_id = community_location_uuid)
+--   dwh.dim_patients                       Patient demographics (includes full location hierarchy)
+--   dwh.fact_opensrp_immunizations         Dose records
 --   dwh.dim_opensrp_practitioner          VHT name (join: practitioner_id = patient.practitioner)
 --
 -- Outputs:
@@ -34,7 +33,7 @@
 -- 1. mv_imm_patient_status
 -- ============================================================================
 
-DROP MATERIALIZED VIEW IF EXISTS dwh.mv_imm_patient_status;
+DROP MATERIALIZED VIEW IF EXISTS dwh.mv_imm_patient_status CASCADE;
 
 CREATE MATERIALIZED VIEW dwh.mv_imm_patient_status AS
 
@@ -202,38 +201,35 @@ SELECT
     -- ── Patient identity ──────────────────────────────────────────────────
     p.patient_id,
     p.patient_name,
-    p.sex                                                       AS gender,
-    p.date_of_birth,
+    p.gender,
+    p.birth_date                                                AS date_of_birth,
 
-    (CURRENT_DATE - p.date_of_birth::date)                     AS age_days,
+    (CURRENT_DATE - p.birth_date)                              AS age_days,
 
-    (EXTRACT(YEAR  FROM AGE(CURRENT_DATE, p.date_of_birth::date)) * 12
-     + EXTRACT(MONTH FROM AGE(CURRENT_DATE, p.date_of_birth::date))
+    (EXTRACT(YEAR  FROM AGE(CURRENT_DATE, p.birth_date)) * 12
+     + EXTRACT(MONTH FROM AGE(CURRENT_DATE, p.birth_date))
     )::int                                                      AS age_months,
 
-    EXTRACT(YEAR FROM AGE(CURRENT_DATE, p.date_of_birth::date))::int
-                                                                AS age_years,
+    EXTRACT(YEAR FROM AGE(CURRENT_DATE, p.birth_date))::int    AS age_years,
 
     -- ── Contact ───────────────────────────────────────────────────────────
     p.phone_number                                              AS caregiver_phone,
-    p.is_active,
 
     -- ── VHT info ─────────────────────────────────────────────────────────
     pr.practitioner_id                                          AS vht_id,
     pr.practitioner_name                                        AS vht_name,
     NULL::text                                                  AS vht_phone,
 
-    -- ── Location hierarchy ────────────────────────────────────────────────
-    -- Joined via community_location_uuid → dim_opensrp_locations_mapping.location_id
-    lm.village_name,
-    lm.parish_name,
-    lm.health_facility_name,
-    lm.subcounty_name,
-    lm.county_name,
-    lm.district_name,
-    lm.region_name,
-    lm.reporting_facility_name,
-    lm.reporting_dhis2_orgunit_uid,
+    -- ── Location hierarchy — from dim_patients directly ───────────────────
+    p.village_name,
+    p.parish_name,
+    p.health_facility_name,
+    p.subcounty_name,
+    p.county_name,
+    p.district_name,
+    p.region_name,
+    p.reporting_facility_name,
+    p.reporting_dhis2_orgunit_uid,
 
     -- ── Child immunization dose dates (NULL = not yet received) ───────────
     d.bcg_date,
@@ -275,7 +271,7 @@ SELECT
     --
     -- is_zero_dose: no child_immunization doses AND age ≤ 24 months (730 days)
     (   COALESCE(d.child_doses_received, 0) = 0
-    AND (CURRENT_DATE - p.date_of_birth::date) <= 730
+    AND (CURRENT_DATE - p.birth_date) <= 730
     )                                                           AS is_zero_dose,
 
     -- is_fic: all 18 Uganda EPI schedule doses received
@@ -312,29 +308,28 @@ SELECT
         AND d.ipv1_date IS NOT NULL AND d.mr1_date IS NOT NULL
         AND d.yf_date IS NOT NULL AND d.mr2_date IS NOT NULL
     )
-    AND (CURRENT_DATE - p.date_of_birth::date) <= 1825         -- ≤ 60 months
+    AND (CURRENT_DATE - p.birth_date) <= 1825                  -- ≤ 60 months
     )                                                           AS is_under_immunised,
 
     -- ── Metadata ──────────────────────────────────────────────────────────
     CURRENT_DATE                                                AS snapshot_date
 
-FROM dwh.dim_opensrp_patient p
+FROM dwh.dim_patients p
 
 LEFT JOIN doses d
        ON d.patient_id = p.patient_id
 
-LEFT JOIN dwh.dim_opensrp_locations_mapping lm
-       ON lm.location_id = p.community_location_uuid
+LEFT JOIN (
+    SELECT DISTINCT ON (practitioner_id)
+        practitioner_id,
+        practitioner_name
+    FROM dwh.dim_opensrp_practitioner
+    ORDER BY practitioner_id
+) pr ON pr.practitioner_id = p.practitioner_id
 
-LEFT JOIN dwh.dim_opensrp_practitioner pr
-       ON pr.practitioner_id = p.practitioner
-      AND pr.is_current_flag = 'true'
-
-WHERE p.date_of_birth IS NOT NULL
-  AND p.date_of_birth <> ''
-  AND p.date_of_birth::date BETWEEN CURRENT_DATE - INTERVAL '5 years' AND CURRENT_DATE
-  AND (p.deceased IS NULL OR p.deceased = 'false')
-  AND p.is_current_flag = 'true'
+WHERE p.birth_date IS NOT NULL
+  AND p.birth_date BETWEEN CURRENT_DATE - INTERVAL '5 years' AND CURRENT_DATE
+  AND (p.is_deceased IS NULL OR p.is_deceased = false)
 ;
 
 -- Indexes
