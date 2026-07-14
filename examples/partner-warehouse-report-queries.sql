@@ -1,86 +1,86 @@
 -- ============================================================
 -- eCHIS Immunization Report Queries — Partner Warehouse
 -- ============================================================
--- Source: dwh.mv_imm_patient_status
+-- Sources:
+--   dwh.fact_imm_patient_monthly   One row per child × reporting month.
+--                                  Use for patient-level line lists and
+--                                  custom aggregations.
+--   dwh.v_imm_location_monthly     Pre-aggregated by location × month.
+--                                  Use for summary KPI tables.
 --
--- This view is a snapshot of all registered children (under 5)
--- with their immunization status as of the last refresh date.
---
--- HOW TO REFRESH (run daily, or on demand before reporting):
---   REFRESH MATERIALIZED VIEW CONCURRENTLY dwh.mv_imm_patient_status;
---
--- WHEN WAS IT LAST REFRESHED?
---   SELECT MAX(snapshot_date) FROM dwh.mv_imm_patient_status;
+-- HOW TO FILTER BY MONTH:
+--   Add: WHERE reporting_month = '2025-06-01'   (first day of the month)
+--   Available months: 2023-09-01 → current month
 --
 -- HOW TO FILTER BY LOCATION:
---   National      — remove the location filter entirely
---   District      — AND district_name    = 'Kampala'
---   Subcounty     — AND subcounty_name   = 'Kawempe Division'
---   Health Facility — AND health_facility_name = 'Kawempe HC IV'
---   Village       — AND village_name     = 'Bwaise I'
+--   National        — remove location filter entirely
+--   District        — AND district_name         = 'Kampala'
+--   Subcounty       — AND subcounty_name        = 'Kawempe Division'
+--   Health Facility — AND health_facility_name  = 'Kawempe HC IV'
+--   Village         — AND village_name          = 'Bwaise I'
 --
 -- ZERO-DOSE DEFINITION:
---   Child aged 0–24 months with no child immunization doses recorded.
---   Malaria and HPV doses do NOT count.
+--   Child aged 0–24 months with no child immunization doses recorded
+--   as of end of the reporting month. Malaria and HPV do NOT count.
 --
 -- FIC DEFINITION:
---   All 19 Uganda EPI doses received (BCG, HepB0, OPV0-3,
---   DPT1-3, PCV1-3, Rota1-2, IPV1-2, MR1, YF, MR2).
+--   All 19 Uganda EPI doses received by end of the reporting month
+--   (BCG, HepB0, OPV0-3, DPT1-3, PCV1-3, Rota1-2, IPV1-2, MR1, YF, MR2).
+--
+-- HOUSEHOLD REPORTING:
+--   household_id is in dwh.dim_patients. Join when needed:
+--   JOIN dwh.dim_patients p ON p.patient_id = f.patient_id
 --
 -- NOTE FOR DEV TEAM — ETL mapping gap:
 --   Most immunization records in fact_opensrp_immunizations currently
 --   land with programme = 'unknown' and antigen_group = NULL because
---   the ETL questionnaire mapping is incomplete. The MV bypasses this
---   entirely and derives all doses directly from the vaccine_name field.
---   The dev team should add the following questionnaire IDs to the ETL
---   mapping to correct the upstream data:
+--   the ETL questionnaire mapping is incomplete. Queries derive doses
+--   directly from vaccine_name to work around this. The following
+--   questionnaire IDs should be added to the ETL mapping:
 --     Questionnaire/child-immunization-record-all
 --     Questionnaire/malaria-vaccine-record
 --     Questionnaire/hpv-vaccine-record
 --     Questionnaire/6965f0fc-e0e9-449e-941a-c6e708cc9dd6  (legacy)
---
--- NOTE: caregiver_phone is NULL in all current records.
---   The source data does not yet carry phone numbers through to this table.
 -- ============================================================
 
 
 -- ============================================================
 -- 1. KPI SUMMARY
 -- ============================================================
--- Returns one row with all headline indicators.
--- Adjust the location filter for the level you need.
+-- Returns one row with all headline indicators for a given month.
+-- Change the reporting_month value and location filter as needed.
 -- ============================================================
 
 SELECT
-    MAX(snapshot_date)                                                      AS as_of_date,
+    reporting_month                                                            AS as_of_month,
 
-    COUNT(*)                                                                AS registered_children,
+    COUNT(*)                                                                   AS registered_children,
 
-    COUNT(*) FILTER (WHERE age_days BETWEEN 0 AND 730)                     AS eligible_0_24m,
+    COUNT(*) FILTER (WHERE age_days_at_period BETWEEN 0 AND 730)              AS eligible_0_24m,
 
-    COUNT(*) FILTER (WHERE age_days BETWEEN 0 AND 1825)                    AS eligible_under5,
+    COUNT(*) FILTER (WHERE age_days_at_period BETWEEN 0 AND 1825)             AS eligible_under5,
 
-    COUNT(*) FILTER (WHERE is_zero_dose)                                    AS zero_dose_count,
+    COUNT(*) FILTER (WHERE is_zero_dose)                                       AS zero_dose_count,
 
     ROUND(
         100.0 * COUNT(*) FILTER (WHERE is_zero_dose)
-        / NULLIF(COUNT(*) FILTER (WHERE age_days BETWEEN 0 AND 730), 0), 1
-    )                                                                       AS zero_dose_pct,
+        / NULLIF(COUNT(*) FILTER (WHERE age_days_at_period BETWEEN 0 AND 730), 0), 1
+    )                                                                          AS zero_dose_pct,
 
-    COUNT(*) FILTER (WHERE is_under_immunised)                             AS under_immunised_count,
+    COUNT(*) FILTER (WHERE is_under_immunised)                                AS under_immunised_count,
 
-    COUNT(*) FILTER (WHERE is_fic)                                          AS fic_count,
+    COUNT(*) FILTER (WHERE is_fic)                                             AS fic_count,
 
     ROUND(
         100.0 * COUNT(*) FILTER (WHERE is_fic)
-        / NULLIF(COUNT(*) FILTER (WHERE age_days >= 540), 0), 1            -- ≥18 months
-    )                                                                       AS fic_coverage_pct
+        / NULLIF(COUNT(*) FILTER (WHERE age_days_at_period >= 540), 0), 1
+    )                                                                          AS fic_coverage_pct
 
-FROM dwh.mv_imm_patient_status
--- WHERE district_name    = 'Kampala'        -- district level
--- WHERE subcounty_name   = 'Kawempe Division' -- subcounty level
--- WHERE health_facility_name = 'Kawempe HC IV' -- facility level
-;
+FROM dwh.fact_imm_patient_monthly
+WHERE reporting_month = '2025-06-01'              -- replace with target month
+-- AND district_name    = 'Kampala'
+-- AND subcounty_name   = 'Kawempe Division'
+GROUP BY reporting_month;
 
 
 -- ============================================================
@@ -92,63 +92,63 @@ FROM dwh.mv_imm_patient_status
 
 WITH cohort AS (
     SELECT *
-    FROM dwh.mv_imm_patient_status
-    -- WHERE district_name        = 'Kampala'
-    -- WHERE subcounty_name       = 'Kawempe Division'
-    -- WHERE health_facility_name = 'Kawempe HC IV'
+    FROM dwh.fact_imm_patient_monthly
+    WHERE reporting_month = '2025-06-01'          -- replace with target month
+    -- AND district_name        = 'Kampala'
+    -- AND subcounty_name       = 'Kawempe Division'
 ),
 counts AS (
     SELECT
-        COUNT(*)                                  AS all_children,
-        COUNT(*) FILTER (WHERE age_days >= 42)    AS age_6w_plus,
-        COUNT(*) FILTER (WHERE age_days >= 70)    AS age_10w_plus,
-        COUNT(*) FILTER (WHERE age_days >= 98)    AS age_14w_plus,
-        COUNT(*) FILTER (WHERE age_days >= 270)   AS age_9m_plus,
-        COUNT(*) FILTER (WHERE age_days >= 540)   AS age_18m_plus,
-        COUNT(*) FILTER (WHERE bcg_date    IS NOT NULL) AS bcg,
-        COUNT(*) FILTER (WHERE hepb0_date  IS NOT NULL) AS hepb0,
-        COUNT(*) FILTER (WHERE opv0_date   IS NOT NULL) AS opv0,
-        COUNT(*) FILTER (WHERE opv1_date   IS NOT NULL) AS opv1,
-        COUNT(*) FILTER (WHERE dpt1_date   IS NOT NULL) AS dpt1,
-        COUNT(*) FILTER (WHERE pcv1_date   IS NOT NULL) AS pcv1,
-        COUNT(*) FILTER (WHERE rota1_date  IS NOT NULL) AS rota1,
-        COUNT(*) FILTER (WHERE ipv1_date   IS NOT NULL) AS ipv1,
-        COUNT(*) FILTER (WHERE opv2_date   IS NOT NULL) AS opv2,
-        COUNT(*) FILTER (WHERE dpt2_date   IS NOT NULL) AS dpt2,
-        COUNT(*) FILTER (WHERE pcv2_date   IS NOT NULL) AS pcv2,
-        COUNT(*) FILTER (WHERE rota2_date  IS NOT NULL) AS rota2,
-        COUNT(*) FILTER (WHERE opv3_date   IS NOT NULL) AS opv3,
-        COUNT(*) FILTER (WHERE dpt3_date   IS NOT NULL) AS dpt3,
-        COUNT(*) FILTER (WHERE pcv3_date   IS NOT NULL) AS pcv3,
-        COUNT(*) FILTER (WHERE ipv2_date   IS NOT NULL) AS ipv2,
-        COUNT(*) FILTER (WHERE mr1_date    IS NOT NULL) AS mr1,
-        COUNT(*) FILTER (WHERE yf_date     IS NOT NULL) AS yf,
-        COUNT(*) FILTER (WHERE mr2_date    IS NOT NULL) AS mr2
+        COUNT(*)                                              AS all_children,
+        COUNT(*) FILTER (WHERE age_days_at_period >= 42)     AS age_6w_plus,
+        COUNT(*) FILTER (WHERE age_days_at_period >= 70)     AS age_10w_plus,
+        COUNT(*) FILTER (WHERE age_days_at_period >= 98)     AS age_14w_plus,
+        COUNT(*) FILTER (WHERE age_days_at_period >= 270)    AS age_9m_plus,
+        COUNT(*) FILTER (WHERE age_days_at_period >= 540)    AS age_18m_plus,
+        COUNT(*) FILTER (WHERE bcg_date    IS NOT NULL)      AS bcg,
+        COUNT(*) FILTER (WHERE hepb0_date  IS NOT NULL)      AS hepb0,
+        COUNT(*) FILTER (WHERE opv0_date   IS NOT NULL)      AS opv0,
+        COUNT(*) FILTER (WHERE opv1_date   IS NOT NULL)      AS opv1,
+        COUNT(*) FILTER (WHERE dpt1_date   IS NOT NULL)      AS dpt1,
+        COUNT(*) FILTER (WHERE pcv1_date   IS NOT NULL)      AS pcv1,
+        COUNT(*) FILTER (WHERE rota1_date  IS NOT NULL)      AS rota1,
+        COUNT(*) FILTER (WHERE ipv1_date   IS NOT NULL)      AS ipv1,
+        COUNT(*) FILTER (WHERE opv2_date   IS NOT NULL)      AS opv2,
+        COUNT(*) FILTER (WHERE dpt2_date   IS NOT NULL)      AS dpt2,
+        COUNT(*) FILTER (WHERE pcv2_date   IS NOT NULL)      AS pcv2,
+        COUNT(*) FILTER (WHERE rota2_date  IS NOT NULL)      AS rota2,
+        COUNT(*) FILTER (WHERE opv3_date   IS NOT NULL)      AS opv3,
+        COUNT(*) FILTER (WHERE dpt3_date   IS NOT NULL)      AS dpt3,
+        COUNT(*) FILTER (WHERE pcv3_date   IS NOT NULL)      AS pcv3,
+        COUNT(*) FILTER (WHERE ipv2_date   IS NOT NULL)      AS ipv2,
+        COUNT(*) FILTER (WHERE mr1_date    IS NOT NULL)      AS mr1,
+        COUNT(*) FILTER (WHERE yf_date     IS NOT NULL)      AS yf,
+        COUNT(*) FILTER (WHERE mr2_date    IS NOT NULL)      AS mr2
     FROM cohort
 )
 SELECT ord, vaccine, dose_label, due_age, eligible, received,
-       ROUND(100.0 * received / NULLIF(eligible, 0), 1) AS coverage_pct
+       ROUND(100.0 * received / NULLIF(eligible, 0), 1)      AS coverage_pct
 FROM counts,
 LATERAL (VALUES
-    (1,  'BCG',              'Birth',   '0 days',    all_children,  bcg),
-    (2,  'HepB 0',           'Birth',   '0 days',    all_children,  hepb0),
-    (3,  'OPV 0',            'Birth',   '0 days',    all_children,  opv0),
-    (4,  'OPV 1',            'Dose 1',  '6 weeks',   age_6w_plus,   opv1),
-    (5,  'DPT-HepB-Hib 1',  'Dose 1',  '6 weeks',   age_6w_plus,   dpt1),
-    (6,  'PCV 1',            'Dose 1',  '6 weeks',   age_6w_plus,   pcv1),
-    (7,  'Rota 1',           'Dose 1',  '6 weeks',   age_6w_plus,   rota1),
-    (8,  'IPV 1',            'Dose 1',  '6 weeks',   age_6w_plus,   ipv1),
-    (9,  'OPV 2',            'Dose 2',  '10 weeks',  age_10w_plus,  opv2),
-    (10, 'DPT-HepB-Hib 2',  'Dose 2',  '10 weeks',  age_10w_plus,  dpt2),
-    (11, 'PCV 2',            'Dose 2',  '10 weeks',  age_10w_plus,  pcv2),
-    (12, 'Rota 2',           'Dose 2',  '10 weeks',  age_10w_plus,  rota2),
-    (13, 'OPV 3',            'Dose 3',  '14 weeks',  age_14w_plus,  opv3),
-    (14, 'DPT-HepB-Hib 3',  'Dose 3',  '14 weeks',  age_14w_plus,  dpt3),
-    (15, 'PCV 3',            'Dose 3',  '14 weeks',  age_14w_plus,  pcv3),
-    (16, 'IPV 2',            'Dose 2',  '14 weeks',  age_14w_plus,  ipv2),
-    (17, 'Measles-Rubella 1','Dose 1',  '9 months',  age_9m_plus,   mr1),
-    (18, 'Yellow Fever',     'Dose 1',  '9 months',  age_9m_plus,   yf),
-    (19, 'Measles-Rubella 2','Dose 2',  '18 months', age_18m_plus,  mr2)
+    (1,  'BCG',              'Birth',    '0 days',   all_children,  bcg),
+    (2,  'HepB 0',           'Birth',    '0 days',   all_children,  hepb0),
+    (3,  'OPV 0',            'Birth',    '0 days',   all_children,  opv0),
+    (4,  'OPV 1',            'Dose 1',   '6 weeks',  age_6w_plus,   opv1),
+    (5,  'DPT-HepB-Hib 1',  'Dose 1',   '6 weeks',  age_6w_plus,   dpt1),
+    (6,  'PCV 1',            'Dose 1',   '6 weeks',  age_6w_plus,   pcv1),
+    (7,  'Rota 1',           'Dose 1',   '6 weeks',  age_6w_plus,   rota1),
+    (8,  'IPV 1',            'Dose 1',   '6 weeks',  age_6w_plus,   ipv1),
+    (9,  'OPV 2',            'Dose 2',   '10 weeks', age_10w_plus,  opv2),
+    (10, 'DPT-HepB-Hib 2',  'Dose 2',   '10 weeks', age_10w_plus,  dpt2),
+    (11, 'PCV 2',            'Dose 2',   '10 weeks', age_10w_plus,  pcv2),
+    (12, 'Rota 2',           'Dose 2',   '10 weeks', age_10w_plus,  rota2),
+    (13, 'OPV 3',            'Dose 3',   '14 weeks', age_14w_plus,  opv3),
+    (14, 'DPT-HepB-Hib 3',  'Dose 3',   '14 weeks', age_14w_plus,  dpt3),
+    (15, 'PCV 3',            'Dose 3',   '14 weeks', age_14w_plus,  pcv3),
+    (16, 'IPV 2',            'Dose 2',   '14 weeks', age_14w_plus,  ipv2),
+    (17, 'Measles-Rubella 1','Dose 1',   '9 months', age_9m_plus,   mr1),
+    (18, 'Yellow Fever',     'Dose 1',   '9 months', age_9m_plus,   yf),
+    (19, 'Measles-Rubella 2','Dose 2',   '18 months',age_18m_plus,  mr2)
 ) AS v(ord, vaccine, dose_label, due_age, eligible, received)
 ORDER BY ord;
 
@@ -165,21 +165,21 @@ SELECT
     patient_name,
     gender,
     date_of_birth,
-    age_months,
+    age_months_at_period                                                       AS age_months,
     caregiver_phone,
     vht_name,
     village_name,
     parish_name,
     subcounty_name,
     health_facility_name,
-    snapshot_date
+    reporting_month
 
-FROM dwh.mv_imm_patient_status
-WHERE is_zero_dose = true
+FROM dwh.fact_imm_patient_monthly
+WHERE reporting_month = '2025-06-01'              -- replace with target month
+  AND is_zero_dose    = true
   -- AND district_name    = 'Kampala'
   -- AND subcounty_name   = 'Kawempe Division'
-  -- AND health_facility_name = 'Kawempe HC IV'
-ORDER BY age_months DESC, village_name, patient_name;
+ORDER BY age_months_at_period DESC, village_name, patient_name;
 
 
 -- ============================================================
@@ -194,7 +194,7 @@ SELECT
     patient_name,
     gender,
     date_of_birth,
-    age_months,
+    age_months_at_period                                                       AS age_months,
     caregiver_phone,
     vht_name,
     village_name,
@@ -203,41 +203,41 @@ SELECT
     health_facility_name,
     child_doses_received,
     CONCAT_WS(', ',
-        CASE WHEN bcg_date    IS NULL                        THEN 'BCG'    END,
-        CASE WHEN hepb0_date  IS NULL                        THEN 'HepB0'  END,
-        CASE WHEN opv0_date   IS NULL                        THEN 'OPV0'   END,
-        CASE WHEN opv1_date   IS NULL AND age_days >= 42     THEN 'OPV1'   END,
-        CASE WHEN dpt1_date   IS NULL AND age_days >= 42     THEN 'DPT1'   END,
-        CASE WHEN pcv1_date   IS NULL AND age_days >= 42     THEN 'PCV1'   END,
-        CASE WHEN rota1_date  IS NULL AND age_days >= 42     THEN 'Rota1'  END,
-        CASE WHEN ipv1_date   IS NULL AND age_days >= 42     THEN 'IPV1'   END,
-        CASE WHEN opv2_date   IS NULL AND age_days >= 70     THEN 'OPV2'   END,
-        CASE WHEN dpt2_date   IS NULL AND age_days >= 70     THEN 'DPT2'   END,
-        CASE WHEN pcv2_date   IS NULL AND age_days >= 70     THEN 'PCV2'   END,
-        CASE WHEN rota2_date  IS NULL AND age_days >= 70     THEN 'Rota2'  END,
-        CASE WHEN opv3_date   IS NULL AND age_days >= 98     THEN 'OPV3'   END,
-        CASE WHEN dpt3_date   IS NULL AND age_days >= 98     THEN 'DPT3'   END,
-        CASE WHEN pcv3_date   IS NULL AND age_days >= 98     THEN 'PCV3'   END,
-        CASE WHEN ipv2_date   IS NULL AND age_days >= 98     THEN 'IPV2'   END,
-        CASE WHEN mr1_date    IS NULL AND age_days >= 270    THEN 'MR1'    END,
-        CASE WHEN yf_date     IS NULL AND age_days >= 270    THEN 'YF'     END,
-        CASE WHEN mr2_date    IS NULL AND age_days >= 540    THEN 'MR2'    END
-    )                                                                       AS missing_doses,
-    snapshot_date
+        CASE WHEN bcg_date    IS NULL                                THEN 'BCG'   END,
+        CASE WHEN hepb0_date  IS NULL                                THEN 'HepB0' END,
+        CASE WHEN opv0_date   IS NULL                                THEN 'OPV0'  END,
+        CASE WHEN opv1_date   IS NULL AND age_days_at_period >= 42   THEN 'OPV1'  END,
+        CASE WHEN dpt1_date   IS NULL AND age_days_at_period >= 42   THEN 'DPT1'  END,
+        CASE WHEN pcv1_date   IS NULL AND age_days_at_period >= 42   THEN 'PCV1'  END,
+        CASE WHEN rota1_date  IS NULL AND age_days_at_period >= 42   THEN 'Rota1' END,
+        CASE WHEN ipv1_date   IS NULL AND age_days_at_period >= 42   THEN 'IPV1'  END,
+        CASE WHEN opv2_date   IS NULL AND age_days_at_period >= 70   THEN 'OPV2'  END,
+        CASE WHEN dpt2_date   IS NULL AND age_days_at_period >= 70   THEN 'DPT2'  END,
+        CASE WHEN pcv2_date   IS NULL AND age_days_at_period >= 70   THEN 'PCV2'  END,
+        CASE WHEN rota2_date  IS NULL AND age_days_at_period >= 70   THEN 'Rota2' END,
+        CASE WHEN opv3_date   IS NULL AND age_days_at_period >= 98   THEN 'OPV3'  END,
+        CASE WHEN dpt3_date   IS NULL AND age_days_at_period >= 98   THEN 'DPT3'  END,
+        CASE WHEN pcv3_date   IS NULL AND age_days_at_period >= 98   THEN 'PCV3'  END,
+        CASE WHEN ipv2_date   IS NULL AND age_days_at_period >= 98   THEN 'IPV2'  END,
+        CASE WHEN mr1_date    IS NULL AND age_days_at_period >= 270  THEN 'MR1'   END,
+        CASE WHEN yf_date     IS NULL AND age_days_at_period >= 270  THEN 'YF'    END,
+        CASE WHEN mr2_date    IS NULL AND age_days_at_period >= 540  THEN 'MR2'   END
+    )                                                                          AS missing_doses,
+    reporting_month
 
-FROM dwh.mv_imm_patient_status
-WHERE is_under_immunised = true
+FROM dwh.fact_imm_patient_monthly
+WHERE reporting_month    = '2025-06-01'           -- replace with target month
+  AND is_under_immunised = true
   -- AND district_name    = 'Kampala'
   -- AND subcounty_name   = 'Kawempe Division'
-  -- AND health_facility_name = 'Kawempe HC IV'
-ORDER BY age_months DESC, village_name, patient_name;
+ORDER BY age_months_at_period DESC, village_name, patient_name;
 
 
 -- ============================================================
 -- 5. VHT CASELOAD SUMMARY
 -- ============================================================
--- One row per VHT showing their eligible, zero-dose,
--- under-immunised, and FIC counts.
+-- One row per VHT showing eligible, zero-dose,
+-- under-immunised, and FIC counts for the month.
 -- ============================================================
 
 SELECT
@@ -246,24 +246,24 @@ SELECT
     parish_name,
     subcounty_name,
 
-    COUNT(*)                                                                AS eligible_children,
+    COUNT(*)                                                                   AS eligible_children,
 
-    COUNT(*) FILTER (WHERE age_days BETWEEN 0 AND 730)                     AS eligible_0_24m,
+    COUNT(*) FILTER (WHERE age_days_at_period BETWEEN 0 AND 730)              AS eligible_0_24m,
 
-    COUNT(*) FILTER (WHERE is_zero_dose)                                    AS zero_dose_count,
+    COUNT(*) FILTER (WHERE is_zero_dose)                                       AS zero_dose_count,
 
     ROUND(
         100.0 * COUNT(*) FILTER (WHERE is_zero_dose)
-        / NULLIF(COUNT(*) FILTER (WHERE age_days BETWEEN 0 AND 730), 0), 1
-    )                                                                       AS zero_dose_pct,
+        / NULLIF(COUNT(*) FILTER (WHERE age_days_at_period BETWEEN 0 AND 730), 0), 1
+    )                                                                          AS zero_dose_pct,
 
-    COUNT(*) FILTER (WHERE is_under_immunised)                             AS under_immunised_count,
+    COUNT(*) FILTER (WHERE is_under_immunised)                                AS under_immunised_count,
 
-    COUNT(*) FILTER (WHERE is_fic)                                          AS fic_count
+    COUNT(*) FILTER (WHERE is_fic)                                             AS fic_count
 
-FROM dwh.mv_imm_patient_status
--- WHERE subcounty_name = 'Kawempe Division'
--- WHERE health_facility_name = 'Kawempe HC IV'
+FROM dwh.fact_imm_patient_monthly
+WHERE reporting_month = '2025-06-01'              -- replace with target month
+-- AND subcounty_name  = 'Kawempe Division'
 GROUP BY vht_name, village_name, parish_name, subcounty_name
 ORDER BY zero_dose_count DESC;
 
@@ -271,8 +271,7 @@ ORDER BY zero_dose_count DESC;
 -- ============================================================
 -- 6. VILLAGE BURDEN TABLE
 -- ============================================================
--- Zero-dose and under-immunised count per village.
--- Useful for planning outreach and prioritizing follow-up.
+-- Zero-dose and under-immunised count per village for a month.
 -- ============================================================
 
 SELECT
@@ -282,78 +281,111 @@ SELECT
     health_facility_name,
     village_name,
 
-    COUNT(*) FILTER (WHERE age_days BETWEEN 0 AND 730)                     AS eligible_0_24m,
-    COUNT(*) FILTER (WHERE is_zero_dose)                                    AS zero_dose_count,
-    COUNT(*) FILTER (WHERE is_under_immunised)                             AS under_immunised_count,
-    COUNT(*) FILTER (WHERE is_fic)                                          AS fic_count,
+    eligible_0_24m,
+    zero_dose_count,
+    zero_dose_pct,
+    under_immunised_count,
+    fic_count
 
-    ROUND(
-        100.0 * COUNT(*) FILTER (WHERE is_zero_dose)
-        / NULLIF(COUNT(*) FILTER (WHERE age_days BETWEEN 0 AND 730), 0), 1
-    )                                                                       AS zero_dose_pct
-
-FROM dwh.mv_imm_patient_status
--- WHERE district_name  = 'Kampala'
--- WHERE subcounty_name = 'Kawempe Division'
-GROUP BY district_name, subcounty_name, parish_name, health_facility_name, village_name
+FROM dwh.v_imm_location_monthly
+WHERE reporting_month = '2025-06-01'              -- replace with target month
+  AND village_name    IS NOT NULL
+  -- AND district_name  = 'Kampala'
 ORDER BY zero_dose_count DESC;
 
 
 -- ============================================================
 -- 7. SUBCOUNTY COMPARISON
 -- ============================================================
--- All subcounties ranked by zero-dose burden.
--- For district monthly report.
+-- All subcounties ranked by zero-dose burden for a given month.
 -- ============================================================
 
 SELECT
     district_name,
     subcounty_name,
-    COUNT(*) FILTER (WHERE age_days BETWEEN 0 AND 730)                     AS eligible_0_24m,
-    COUNT(*) FILTER (WHERE is_zero_dose)                                    AS zero_dose_count,
-    COUNT(*) FILTER (WHERE is_under_immunised)                             AS under_immunised_count,
-    COUNT(*) FILTER (WHERE is_fic)                                          AS fic_count,
-    ROUND(
-        100.0 * COUNT(*) FILTER (WHERE is_zero_dose)
-        / NULLIF(COUNT(*) FILTER (WHERE age_days BETWEEN 0 AND 730), 0), 1
-    )                                                                       AS zero_dose_pct,
-    ROUND(
-        100.0 * COUNT(*) FILTER (WHERE is_fic)
-        / NULLIF(COUNT(*) FILTER (WHERE age_days >= 540), 0), 1
-    )                                                                       AS fic_coverage_pct
+    eligible_0_24m,
+    zero_dose_count,
+    zero_dose_pct,
+    under_immunised_count,
+    fic_count,
+    fic_coverage_pct,
+    dpt1_coverage_pct,
+    mr1_coverage_pct
 
-FROM dwh.mv_imm_patient_status
--- WHERE district_name = 'Kampala'
-GROUP BY district_name, subcounty_name
+FROM dwh.v_imm_location_monthly
+WHERE reporting_month = '2025-06-01'              -- replace with target month
+  AND subcounty_name  IS NOT NULL
+  AND parish_name     IS NULL
+  -- AND district_name = 'Kampala'
 ORDER BY zero_dose_count DESC;
 
 
 -- ============================================================
--- 8. MALARIA VACCINE SUMMARY
+-- 8. MONTHLY TREND — zero-dose by district across all months
+-- ============================================================
+-- Shows how zero-dose burden has changed month by month.
+-- Filter to one district or remove the filter for national.
 -- ============================================================
 
 SELECT
-    COUNT(*) FILTER (WHERE malaria1_date IS NOT NULL)                       AS malaria_dose1,
-    COUNT(*) FILTER (WHERE malaria2_date IS NOT NULL)                       AS malaria_dose2,
-    COUNT(*) FILTER (WHERE malaria3_date IS NOT NULL)                       AS malaria_dose3,
-    COUNT(*) FILTER (WHERE malaria_booster_date IS NOT NULL)                AS malaria_booster,
-    ROUND(
-        100.0 * COUNT(*) FILTER (WHERE malaria_booster_date IS NOT NULL)
-        / NULLIF(COUNT(*) FILTER (WHERE malaria1_date IS NOT NULL), 0), 1
-    )                                                                       AS series_completion_pct
-FROM dwh.mv_imm_patient_status
--- WHERE district_name = 'Kampala'
-;
+    reporting_month,
+    district_name,
+    eligible_0_24m,
+    zero_dose_count,
+    zero_dose_pct,
+    fic_count,
+    fic_coverage_pct
+
+FROM dwh.v_imm_location_monthly
+WHERE subcounty_name IS NULL
+  AND parish_name    IS NULL
+  -- AND district_name = 'Kampala'       -- remove for all districts
+ORDER BY district_name, reporting_month;
 
 
 -- ============================================================
--- 9. FIC CHILDREN LINE LIST
+-- 9. HOUSEHOLD REPORTING
 -- ============================================================
--- One row per fully immunized child (all 19 EPI doses received).
--- Useful for verification, community recognition, and reporting
--- to the district health office.
--- Only children aged ≥18 months (540 days) are eligible for FIC
--- since MR2 is the last dose and is due at 18 months.
+-- How many unique households have zero-dose children.
+-- Joins dim_patients for household_id.
+-- ============================================================
+
+SELECT
+    f.district_name,
+    f.subcounty_name,
+    COUNT(DISTINCT p.household_id)                                             AS households_with_zero_dose,
+    COUNT(*)                                                                   AS zero_dose_children
+
+FROM dwh.fact_imm_patient_monthly f
+JOIN dwh.dim_patients p ON p.patient_id = f.patient_id
+WHERE f.reporting_month = '2025-06-01'            -- replace with target month
+  AND f.is_zero_dose    = true
+  -- AND f.district_name = 'Kampala'
+GROUP BY f.district_name, f.subcounty_name
+ORDER BY households_with_zero_dose DESC;
+
+
+-- ============================================================
+-- 10. MALARIA VACCINE SUMMARY
+-- ============================================================
+
+SELECT
+    reporting_month,
+    SUM(malaria_dose1_count)    AS malaria_dose1,
+    SUM(malaria_complete_count) AS malaria_complete,
+    SUM(hpv_dose1_count)        AS hpv_dose1,
+    SUM(hpv_dose2_count)        AS hpv_dose2
+
+FROM dwh.v_imm_location_monthly
+WHERE reporting_month = '2025-06-01'              -- replace with target month
+  -- AND district_name = 'Kampala'
+GROUP BY reporting_month;
+
+
+-- ============================================================
+-- 11. FIC CHILDREN LINE LIST
+-- ============================================================
+-- One row per fully immunized child as of the reporting month.
 -- ============================================================
 
 SELECT
@@ -361,121 +393,58 @@ SELECT
     patient_name,
     gender,
     date_of_birth,
-    age_months,
+    age_months_at_period                                                       AS age_months,
     vht_name,
     village_name,
     parish_name,
     subcounty_name,
     health_facility_name,
     district_name,
+    mr2_date                                                                   AS fic_completion_date,
+    reporting_month
 
-    -- Date each dose was received
-    bcg_date,
-    hepb0_date,
-    opv0_date,
-    opv1_date,
-    dpt1_date,
-    pcv1_date,
-    rota1_date,
-    ipv1_date,
-    opv2_date,
-    dpt2_date,
-    pcv2_date,
-    rota2_date,
-    opv3_date,
-    dpt3_date,
-    pcv3_date,
-    ipv2_date,
-    mr1_date,
-    yf_date,
-    mr2_date,
-
-    -- Date the last required dose (MR2) was received — effectively the FIC completion date
-    mr2_date                                                                AS fic_completion_date,
-
-    snapshot_date
-
-FROM dwh.mv_imm_patient_status
-WHERE is_fic = true
+FROM dwh.fact_imm_patient_monthly
+WHERE reporting_month = '2025-06-01'              -- replace with target month
+  AND is_fic          = true
   -- AND district_name        = 'Kampala'
   -- AND subcounty_name       = 'Kawempe Division'
-  -- AND health_facility_name = 'Kawempe HC IV'
 ORDER BY mr2_date DESC, village_name, patient_name;
 
 
 -- ============================================================
--- 10. FULL PATIENT STATUS EXPORT
+-- 12. FULL PATIENT STATUS EXPORT
 -- ============================================================
--- All registered children with every dose date column.
--- Use this when you need to export the full dataset to Excel
--- or another tool for custom analysis.
--- Tip: in pgAdmin, run the query then right-click the result
--- grid → "Copy All Rows" or use File → Export to CSV.
+-- All registered children with every dose date for a given month.
+-- Export to CSV from pgAdmin: right-click result → Copy All Rows.
 -- ============================================================
 
 SELECT
-    -- Identity
+    reporting_month,
     patient_id,
     patient_name,
     gender,
     date_of_birth,
-    age_days,
-    age_months,
-
-    -- Status flags
+    age_days_at_period                                                         AS age_days,
+    age_months_at_period                                                       AS age_months,
     is_zero_dose,
     is_under_immunised,
     is_fic,
     child_doses_received,
-
-    -- Child EPI dose dates (NULL = not yet received)
-    bcg_date,
-    hepb0_date,
-    opv0_date,
-    opv1_date,
-    dpt1_date,
-    pcv1_date,
-    rota1_date,
-    ipv1_date,
-    opv2_date,
-    dpt2_date,
-    pcv2_date,
-    rota2_date,
-    opv3_date,
-    dpt3_date,
-    pcv3_date,
-    ipv2_date,
-    mr1_date,
-    yf_date,
-    mr2_date,
-
-    -- Malaria dose dates
-    malaria1_date,
-    malaria2_date,
-    malaria3_date,
-    malaria_booster_date,
+    bcg_date, hepb0_date, opv0_date,
+    opv1_date, dpt1_date, pcv1_date, rota1_date, ipv1_date,
+    opv2_date, dpt2_date, pcv2_date, rota2_date,
+    opv3_date, dpt3_date, pcv3_date, ipv2_date,
+    mr1_date, yf_date, mr2_date,
+    malaria1_date, malaria2_date, malaria3_date, malaria_booster_date,
     malaria_doses_received,
-
-    -- HPV dose dates
-    hpv1_date,
-    hpv2_date,
-    hpv_doses_received,
-
-    -- VHT and location
+    hpv1_date, hpv2_date, hpv_doses_received,
     vht_name,
     caregiver_phone,
-    village_name,
-    parish_name,
-    health_facility_name,
-    subcounty_name,
-    county_name,
-    district_name,
-    region_name,
+    village_name, parish_name, health_facility_name,
+    subcounty_name, county_name, district_name, region_name
 
-    snapshot_date
-
-FROM dwh.mv_imm_patient_status
--- WHERE district_name        = 'Kampala'
--- WHERE subcounty_name       = 'Kawempe Division'
--- WHERE health_facility_name = 'Kawempe HC IV'
+FROM dwh.fact_imm_patient_monthly
+WHERE reporting_month = '2025-06-01'              -- replace with target month
+  -- AND district_name        = 'Kampala'
+  -- AND subcounty_name       = 'Kawempe Division'
 ORDER BY district_name, subcounty_name, village_name, patient_name;
