@@ -347,22 +347,43 @@ ORDER BY district_name, reporting_month;
 -- 9. HOUSEHOLD REPORTING
 -- ============================================================
 -- How many unique households have zero-dose children.
--- Joins dim_patients for household_id.
+-- household_id and household_name are included directly in the table.
 -- ============================================================
 
+-- Summary: households with zero-dose children by location
 SELECT
-    f.district_name,
-    f.subcounty_name,
-    COUNT(DISTINCT p.household_id)                                             AS households_with_zero_dose,
+    district_name,
+    subcounty_name,
+    COUNT(DISTINCT household_id)                                               AS households_with_zero_dose,
     COUNT(*)                                                                   AS zero_dose_children
 
-FROM dwh.fact_imm_patient_monthly f
-JOIN dwh.dim_patients p ON p.patient_id = f.patient_id
-WHERE f.reporting_month = '2025-06-01'            -- replace with target month
-  AND f.is_zero_dose    = true
-  -- AND f.district_name = 'Kampala'
-GROUP BY f.district_name, f.subcounty_name
+FROM dwh.fact_imm_patient_monthly
+WHERE reporting_month = '2025-06-01'              -- replace with target month
+  AND is_zero_dose    = true
+  -- AND district_name = 'Kampala'
+GROUP BY district_name, subcounty_name
 ORDER BY households_with_zero_dose DESC;
+
+
+-- Line list: zero-dose children with their household
+SELECT
+    patient_name,
+    gender,
+    date_of_birth,
+    age_months_at_period                                                       AS age_months,
+    household_id,
+    household_name,
+    caregiver_phone,
+    vht_name,
+    village_name,
+    subcounty_name,
+    district_name
+
+FROM dwh.fact_imm_patient_monthly
+WHERE reporting_month = '2025-06-01'              -- replace with target month
+  AND is_zero_dose    = true
+  -- AND district_name = 'Kampala'
+ORDER BY household_id, age_months_at_period DESC;
 
 
 -- ============================================================

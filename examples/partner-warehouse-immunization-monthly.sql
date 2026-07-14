@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS dwh.fact_imm_patient_monthly (
     age_days_at_period            integer,               -- age in days at month-end
     age_months_at_period          integer,               -- age in months at month-end
     caregiver_phone               text,
+    household_id                  text,
+    household_name                text,
     vht_id                        text,
     vht_name                      text,
     -- Location hierarchy (from dim_patients)
@@ -217,6 +219,8 @@ BEGIN
             (EXTRACT(YEAR  FROM AGE(v_month_end, p.birth_date)) * 12
              + EXTRACT(MONTH FROM AGE(v_month_end, p.birth_date)))::integer                     AS age_months_at_period,
             p.phone_number                                                                      AS caregiver_phone,
+            p.household_id,
+            p.household_name,
             pr.practitioner_id                                                                  AS vht_id,
             pr.practitioner_name                                                                AS vht_name,
             -- Location
