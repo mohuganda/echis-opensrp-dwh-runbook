@@ -469,3 +469,173 @@ WHERE reporting_month = '2025-06-01'              -- replace with target month
   -- AND district_name        = 'Kampala'
   -- AND subcounty_name       = 'Kawempe Division'
 ORDER BY district_name, subcounty_name, village_name, patient_name;
+
+
+-- ============================================================
+-- 13. VHT ACTIVITY SUMMARY REPORT
+-- ============================================================
+-- One row per VHT. ALL VHTs of type 'vht' are included, even
+-- those with zero registered patients (true non-reporters).
+--
+-- Driven by dim_opensrp_practitioner so no VHT is silently
+-- excluded. Immunization KPIs, patient counts, and encounter
+-- counts are LEFT JOINed — they show 0 when no data exists.
+--
+-- Location comes from the latest monthly snapshot. VHTs with
+-- no registered patients will show NULL for location columns.
+--
+-- Encounters = immunization doses administered (best available
+-- proxy for VHT activity on the partner warehouse).
+--
+-- Patient/household time windows use last_updated from dim_patients
+-- as registration date proxy (FHIR meta.lastUpdated).
+--
+-- Location filter: uncomment WHERE at the bottom.
+-- Note: filtering by location excludes VHTs with no registered
+-- patients (their location is unknown). Remove location filter
+-- to see all VHTs including those with zero activity.
+-- ============================================================
+
+WITH
+
+-- All VHTs from the practitioner registry — deduplicated.
+-- dim_opensrp_practitioner has up to 24 duplicate rows per practitioner.
+all_vhts AS (
+    SELECT DISTINCT ON (practitioner_id)
+        practitioner_id,
+        practitioner_name
+    FROM dwh.dim_opensrp_practitioner
+    WHERE type = 'vht'
+    ORDER BY practitioner_id
+),
+
+latest_month AS (
+    SELECT MAX(reporting_month) AS m FROM dwh.fact_imm_patient_monthly
+),
+
+-- Current immunization KPIs + location per VHT (latest month only).
+-- VHTs with no patients in the latest month produce no rows here —
+-- they still appear in the final result via the LEFT JOIN from all_vhts.
+current_state AS (
+    SELECT
+        f.vht_id,
+        f.district_name,
+        f.subcounty_name,
+        f.parish_name,
+        f.health_facility_name,
+        f.village_name,
+        COUNT(DISTINCT f.patient_id)                                            AS patients_all_time,
+        COUNT(DISTINCT f.household_id)                                          AS hh_all_time,
+        COUNT(*) FILTER (WHERE f.age_days_at_period BETWEEN 0 AND 730)         AS imm_eligible_0_24m,
+        COUNT(*) FILTER (WHERE f.is_zero_dose)                                  AS imm_zero_dose,
+        COUNT(*) FILTER (WHERE f.is_under_immunised)                            AS imm_under_immunised,
+        COUNT(*) FILTER (WHERE f.is_fic)                                        AS imm_fic
+    FROM dwh.fact_imm_patient_monthly f
+    CROSS JOIN latest_month lm
+    WHERE f.reporting_month = lm.m
+    GROUP BY f.vht_id, f.district_name, f.subcounty_name, f.parish_name, f.health_facility_name, f.village_name
+),
+
+-- Time-windowed patient and household counts.
+-- Uses dim_patients.last_updated as registration date proxy (FHIR meta.lastUpdated).
+patient_time AS (
+    SELECT
+        p.practitioner_id                                                       AS vht_id,
+        COUNT(DISTINCT p.patient_id) FILTER (
+            WHERE p.last_updated >= DATE_TRUNC('year', CURRENT_DATE)
+        )                                                                       AS patients_this_year,
+        COUNT(DISTINCT p.patient_id) FILTER (
+            WHERE p.last_updated >= CURRENT_DATE - INTERVAL '3 months'
+        )                                                                       AS patients_last_3mo,
+        COUNT(DISTINCT p.household_id) FILTER (
+            WHERE p.last_updated >= DATE_TRUNC('year', CURRENT_DATE)
+        )                                                                       AS hh_this_year,
+        COUNT(DISTINCT p.household_id) FILTER (
+            WHERE p.last_updated >= CURRENT_DATE - INTERVAL '3 months'
+        )                                                                       AS hh_last_3mo
+    FROM dwh.dim_patients p
+    WHERE p.birth_date IS NOT NULL
+      AND p.birth_date >= CURRENT_DATE - INTERVAL '5 years'
+      AND (p.is_deceased IS NULL OR p.is_deceased = false)
+    GROUP BY p.practitioner_id
+),
+
+-- Encounter counts (immunization doses administered), joined through
+-- dim_patients for a consistent practitioner link.
+encounters AS (
+    SELECT
+        p.practitioner_id                                                       AS vht_id,
+        COUNT(*)                                                                AS encounters_all_time,
+        COUNT(*) FILTER (
+            WHERE fi.administered_date::date >= DATE_TRUNC('year', CURRENT_DATE)::date
+        )                                                                       AS encounters_this_year,
+        COUNT(*) FILTER (
+            WHERE fi.administered_date::date >= CURRENT_DATE - INTERVAL '3 months'
+        )                                                                       AS encounters_last_3mo,
+        MAX(fi.administered_date::date)                                         AS last_encounter_date
+    FROM dwh.fact_opensrp_immunizations fi
+    JOIN dwh.dim_patients p ON p.patient_id = fi.patient_id
+    WHERE fi.administered_date IS NOT NULL
+      AND fi.administered_date <> ''
+      AND fi.administered_date::date BETWEEN '2018-01-01' AND CURRENT_DATE
+    GROUP BY p.practitioner_id
+)
+
+SELECT
+    CURRENT_DATE                                                                AS report_date,
+    cs.district_name,
+    cs.subcounty_name,
+    cs.parish_name,
+    cs.health_facility_name,
+    cs.village_name,
+    v.practitioner_id,
+    v.practitioner_name,
+
+    -- ── Patients ────────────────────────────────────────────────────────────
+    COALESCE(cs.patients_all_time,    0)                                        AS patients_all_time,
+    COALESCE(pt.patients_this_year,   0)                                        AS patients_this_year,
+    COALESCE(pt.patients_last_3mo,    0)                                        AS patients_last_3mo,
+
+    -- ── Households ──────────────────────────────────────────────────────────
+    COALESCE(cs.hh_all_time,          0)                                        AS hh_all_time,
+    COALESCE(pt.hh_this_year,         0)                                        AS hh_this_year,
+    COALESCE(pt.hh_last_3mo,          0)                                        AS hh_last_3mo,
+
+    -- ── Encounters (immunization doses as proxy) ─────────────────────────────
+    COALESCE(e.encounters_all_time,   0)                                        AS encounters_all_time,
+    COALESCE(e.encounters_this_year,  0)                                        AS encounters_this_year,
+    COALESCE(e.encounters_last_3mo,   0)                                        AS encounters_last_3mo,
+    e.last_encounter_date,
+    CASE
+        WHEN e.last_encounter_date IS NOT NULL
+        THEN (CURRENT_DATE - e.last_encounter_date)::integer
+    END                                                                         AS days_since_last_encounter,
+
+    -- ── Immunization status (imm_ prefix) ────────────────────────────────────
+    COALESCE(cs.imm_eligible_0_24m,   0)                                        AS imm_eligible_0_24m,
+    COALESCE(cs.imm_zero_dose,        0)                                        AS imm_zero_dose,
+    COALESCE(cs.imm_under_immunised,  0)                                        AS imm_under_immunised,
+    COALESCE(cs.imm_fic,              0)                                        AS imm_fic,
+
+    -- ── Activity flags ───────────────────────────────────────────────────────
+    (COALESCE(e.encounters_all_time,  0) > 0)                                   AS has_activity_all_time,
+    (COALESCE(e.encounters_this_year, 0) > 0)                                   AS has_activity_this_year,
+    (COALESCE(e.encounters_last_3mo,  0) > 0)                                   AS has_activity_last_3mo,
+
+    -- ── Non-reporting flags (TRUE = no encounters in that window) ─────────────
+    (COALESCE(e.encounters_all_time,  0) = 0)                                   AS non_reporting_all_time,
+    (COALESCE(e.encounters_this_year, 0) = 0)                                   AS non_reporting_this_year,
+    (COALESCE(e.encounters_last_3mo,  0) = 0)                                   AS non_reporting_last_3mo
+
+FROM all_vhts v
+LEFT JOIN current_state cs ON cs.vht_id = v.practitioner_id
+LEFT JOIN patient_time  pt ON pt.vht_id = v.practitioner_id
+LEFT JOIN encounters    e  ON e.vht_id  = v.practitioner_id
+-- WHERE cs.district_name  = 'Kampala'
+-- WHERE cs.subcounty_name = 'Kawempe Division'
+ORDER BY
+    COALESCE(cs.district_name,        'zzz'),
+    COALESCE(cs.subcounty_name,       'zzz'),
+    COALESCE(cs.health_facility_name, 'zzz'),
+    COALESCE(cs.village_name,         'zzz'),
+    v.practitioner_name;

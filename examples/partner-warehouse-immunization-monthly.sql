@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS dwh.fact_imm_patient_monthly (
     date_of_birth                 date,
     age_days_at_period            integer,               -- age in days at month-end
     age_months_at_period          integer,               -- age in months at month-end
+    age_years_at_period           integer,               -- age in full years at month-end
     caregiver_phone               text,
     household_id                  text,
     household_name                text,
@@ -218,6 +219,7 @@ BEGIN
             (v_month_end - p.birth_date)::integer                                               AS age_days_at_period,
             (EXTRACT(YEAR  FROM AGE(v_month_end, p.birth_date)) * 12
              + EXTRACT(MONTH FROM AGE(v_month_end, p.birth_date)))::integer                     AS age_months_at_period,
+            EXTRACT(YEAR FROM AGE(v_month_end, p.birth_date))::integer                          AS age_years_at_period,
             p.phone_number                                                                      AS caregiver_phone,
             p.household_id,
             p.household_name,
