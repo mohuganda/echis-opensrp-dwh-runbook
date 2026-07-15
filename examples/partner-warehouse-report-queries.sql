@@ -474,15 +474,15 @@ ORDER BY district_name, subcounty_name, village_name, patient_name;
 -- ============================================================
 -- 13. VHT ACTIVITY SUMMARY REPORT
 -- ============================================================
--- One row per VHT. ALL VHTs of type 'vht' are included, even
--- those with zero registered patients (true non-reporters).
+-- One row per VHT. ALL active VHTs are included, even those
+-- with zero registered patients (true non-reporters).
 --
--- Driven by dim_opensrp_practitioner so no VHT is silently
--- excluded. Immunization KPIs, patient counts, and encounter
--- counts are LEFT JOINed — they show 0 when no data exists.
+-- Driven by dim_opensrp_practitioner_assignments (is_vht = 'true')
+-- so no VHT is silently excluded. Location comes from the
+-- assignments table — present even for VHTs with no patients.
 --
--- Location comes from the latest monthly snapshot. VHTs with
--- no registered patients will show NULL for location columns.
+-- Immunization KPIs, patient counts, and encounter counts are
+-- LEFT JOINed — they show 0 when no data exists.
 --
 -- Encounters = immunization doses administered (best available
 -- proxy for VHT activity on the partner warehouse).
@@ -491,39 +491,40 @@ ORDER BY district_name, subcounty_name, village_name, patient_name;
 -- as registration date proxy (FHIR meta.lastUpdated).
 --
 -- Location filter: uncomment WHERE at the bottom.
--- Note: filtering by location excludes VHTs with no registered
--- patients (their location is unknown). Remove location filter
--- to see all VHTs including those with zero activity.
 -- ============================================================
 
 WITH
 
--- All VHTs from the practitioner registry — deduplicated.
--- dim_opensrp_practitioner has up to 24 duplicate rows per practitioner.
+-- All VHTs from the assignments table — one row per VHT (DISTINCT ON).
+-- Provides the full location hierarchy from current assignment, so VHTs
+-- with zero registered patients still appear with a district and village.
+-- is_vht = 'true' excludes supervisors and web admins.
 all_vhts AS (
     SELECT DISTINCT ON (practitioner_id)
         practitioner_id,
-        practitioner_name
-    FROM dwh.dim_opensrp_practitioner
-    WHERE type = 'vht'
-    ORDER BY practitioner_id
+        practitioner_name,
+        district_name,
+        subcounty_name,
+        parish_name,
+        health_facility_name,
+        village_name
+    FROM dwh.dim_opensrp_practitioner_assignments
+    WHERE is_vht = 'true'
+      AND practitioner_active = 'true'
+    ORDER BY practitioner_id, village_name NULLS LAST
 ),
 
 latest_month AS (
     SELECT MAX(reporting_month) AS m FROM dwh.fact_imm_patient_monthly
 ),
 
--- Current immunization KPIs + location per VHT (latest month only).
--- VHTs with no patients in the latest month produce no rows here —
--- they still appear in the final result via the LEFT JOIN from all_vhts.
+-- Current immunization KPIs per VHT (latest month only).
+-- Groups by vht_id only — location comes from all_vhts above.
+-- VHTs with no patients in the latest month produce no rows here;
+-- they still appear via the LEFT JOIN from all_vhts.
 current_state AS (
     SELECT
         f.vht_id,
-        f.district_name,
-        f.subcounty_name,
-        f.parish_name,
-        f.health_facility_name,
-        f.village_name,
         COUNT(DISTINCT f.patient_id)                                            AS patients_all_time,
         COUNT(DISTINCT f.household_id)                                          AS hh_all_time,
         COUNT(*) FILTER (WHERE f.age_days_at_period BETWEEN 0 AND 730)         AS imm_eligible_0_24m,
@@ -533,7 +534,7 @@ current_state AS (
     FROM dwh.fact_imm_patient_monthly f
     CROSS JOIN latest_month lm
     WHERE f.reporting_month = lm.m
-    GROUP BY f.vht_id, f.district_name, f.subcounty_name, f.parish_name, f.health_facility_name, f.village_name
+    GROUP BY f.vht_id
 ),
 
 -- Time-windowed patient and household counts.
@@ -583,11 +584,11 @@ encounters AS (
 
 SELECT
     CURRENT_DATE                                                                AS report_date,
-    cs.district_name,
-    cs.subcounty_name,
-    cs.parish_name,
-    cs.health_facility_name,
-    cs.village_name,
+    v.district_name,
+    v.subcounty_name,
+    v.parish_name,
+    v.health_facility_name,
+    v.village_name,
     v.practitioner_id,
     v.practitioner_name,
 
@@ -631,11 +632,6 @@ FROM all_vhts v
 LEFT JOIN current_state cs ON cs.vht_id = v.practitioner_id
 LEFT JOIN patient_time  pt ON pt.vht_id = v.practitioner_id
 LEFT JOIN encounters    e  ON e.vht_id  = v.practitioner_id
--- WHERE cs.district_name  = 'Kampala'
--- WHERE cs.subcounty_name = 'Kawempe Division'
-ORDER BY
-    COALESCE(cs.district_name,        'zzz'),
-    COALESCE(cs.subcounty_name,       'zzz'),
-    COALESCE(cs.health_facility_name, 'zzz'),
-    COALESCE(cs.village_name,         'zzz'),
-    v.practitioner_name;
+-- WHERE v.district_name  = 'Kampala'
+-- WHERE v.subcounty_name = 'Kawempe Division'
+ORDER BY v.district_name, v.subcounty_name, v.health_facility_name, v.village_name, v.practitioner_name;
