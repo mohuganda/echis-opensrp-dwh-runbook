@@ -506,7 +506,7 @@ all_vhts AS (
         district_name,
         subcounty_name,
         parish_name,
-        health_facility_name,
+        reporting_facility_name                                                 AS health_facility_name,
         village_name
     FROM dwh.dim_opensrp_practitioner_assignments
     WHERE is_vht = 'true'
@@ -580,6 +580,16 @@ encounters AS (
       AND fi.administered_date <> ''
       AND fi.administered_date::date BETWEEN '2018-01-01' AND CURRENT_DATE
     GROUP BY p.practitioner_id
+),
+
+-- Practitioner phone number — dim_opensrp_practitioner has duplicate rows,
+-- so DISTINCT ON to get one contact value per practitioner.
+vht_contacts AS (
+    SELECT DISTINCT ON (practitioner_id)
+        practitioner_id,
+        contact                                                                 AS practitioner_phone
+    FROM dwh.dim_opensrp_practitioner
+    ORDER BY practitioner_id
 )
 
 SELECT
@@ -591,6 +601,7 @@ SELECT
     v.village_name,
     v.practitioner_id,
     v.practitioner_name,
+    vc.practitioner_phone,
 
     -- ── Patients ────────────────────────────────────────────────────────────
     COALESCE(cs.patients_all_time,    0)                                        AS patients_all_time,
@@ -629,9 +640,10 @@ SELECT
     (COALESCE(e.encounters_last_3mo,  0) = 0)                                   AS non_reporting_last_3mo
 
 FROM all_vhts v
-LEFT JOIN current_state cs ON cs.vht_id = v.practitioner_id
-LEFT JOIN patient_time  pt ON pt.vht_id = v.practitioner_id
-LEFT JOIN encounters    e  ON e.vht_id  = v.practitioner_id
+LEFT JOIN current_state cs ON cs.vht_id           = v.practitioner_id
+LEFT JOIN patient_time  pt ON pt.vht_id           = v.practitioner_id
+LEFT JOIN encounters    e  ON e.vht_id            = v.practitioner_id
+LEFT JOIN vht_contacts  vc ON vc.practitioner_id  = v.practitioner_id
 -- WHERE v.district_name  = 'Kampala'
 -- WHERE v.subcounty_name = 'Kawempe Division'
 ORDER BY v.district_name, v.subcounty_name, v.health_facility_name, v.village_name, v.practitioner_name;
